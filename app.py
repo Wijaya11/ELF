@@ -279,18 +279,18 @@ MODEL_SLOTS = ["Ridge","RF","XGB","LGB","SARIMAX","Prophet"]
 
 # ---------- PRESETS (theory-sound defaults) ----------
 PRESETS = {
-    # RJPP governance (weaker magnet, annual-only anchor)
-    "annual_anchor_tolerance": 0.005,  # tighten to <=0.5% at annual level
+    # RJPP governance (stronger alignment for better reference tracking)
+    "annual_anchor_tolerance": 0.015,  # allow 1.5% flexibility at annual level
     "horizon_max_dev": {
-        "h1_3": 0.04,   # 4% for h=1-3
-        "h4_6": 0.04,   # 4% for h=4-6
+        "h1_3": 0.06,   # 6% for h=1-3 (allow more flexibility for patterns)
+        "h4_6": 0.05,   # 5% for h=4-6
         "h7_12": 0.04,  # 4% for h=7-12
         "h13p": 0.04,   # 4% for h>=13
     },
 
     # Smoothing & seasonality
     "smoothing_alpha": 0.0,           # disable unconditional EWM smoothing
-    "seasonal_imprint_beta_default": 0.30,  # baseline seasonal imprint weight (30%) when seasonality is strong
+    "seasonal_imprint_beta_default": 0.45,  # increased seasonal imprint weight (45%) for stronger patterns
 
     # Stability guards
     "non_negativity": True,
@@ -306,7 +306,7 @@ PRESETS = {
 
     # Residual noise (realism)
     "add_noise": True,
-    "noise_scale": 1.0,               # 1.0 by default; acceptable range 1.0–1.1
+    "noise_scale": 1.15,              # increased to 1.15 for more realistic fluctuations
 
     # Ensemble
     "use_meta_learner": True,         # fit Ridge/ElasticNet on val preds
@@ -1089,13 +1089,14 @@ class EnhancedLoadForecaster:
         ]
         train_weights = w_series.loc[X_unscaled.index].astype(float).values if len(X_unscaled) else None
 
-        # Ridge/ElasticNet with optimized feature selection and hyperparameters
+        # Ridge/ElasticNet with enhanced RJPP-focused feature selection
         ridge_features = [
             c for c in [
                 "lag1", "lag2", "lag3", "lag12",
                 "roll3_mean", "roll6_mean", "roll12_mean",
                 "rjpp_gap", "rjpp_mom_pct", "rjpp_yoy_pct",
-                "RJPP_lag1", "rjpp_ratio_lag1"
+                "RJPP_lag1", "RJPP_lag12", "rjpp_ratio_lag1", "rjpp_ratio_lag12",
+                "rjpp_delta12", "month_sin", "month_cos"
             ]
             if c in X_unscaled.columns
         ]
@@ -1317,21 +1318,21 @@ class EnhancedLoadForecaster:
                     yv = val_target.loc[m]
                     if len(Xv):
                         fit_kwargs["eval_set"] = [(Xv.values, yv.values)]
-                # Optimized LightGBM hyperparameters for better performance
+                # Optimized LightGBM hyperparameters for better performance and pattern capture
                 lgb_model = LGBMRegressor(
-                    n_estimators=5000,  # Increased for better learning with early stopping
-                    learning_rate=0.018,  # Slightly reduced for better generalization
-                    num_leaves=40,  # Increased for better expressiveness
-                    max_depth=7,  # Increased depth for better pattern capture
-                    min_data_in_leaf=35,  # Slightly reduced for better fit
-                    feature_fraction=0.8,  # Increased for better feature utilization
-                    bagging_fraction=0.8,  # Increased for better generalization
+                    n_estimators=6000,  # Increased for better learning with early stopping
+                    learning_rate=0.015,  # Reduced for better generalization and pattern capture
+                    num_leaves=50,  # Increased for better expressiveness
+                    max_depth=8,  # Increased depth for better pattern capture
+                    min_data_in_leaf=25,  # Further reduced for better fit
+                    feature_fraction=0.85,  # Increased for better feature utilization
+                    bagging_fraction=0.85,  # Increased for better generalization
                     bagging_freq=1,
-                    lambda_l1=0.08,  # Slightly reduced L1 regularization
-                    lambda_l2=8.0,  # Slightly reduced L2 regularization
+                    lambda_l1=0.05,  # Further reduced L1 regularization for better fit
+                    lambda_l2=5.0,  # Reduced L2 regularization for better fit
                     min_gain_to_split=0.0,
                     min_child_weight=0.001,  # Added for better control
-                    path_smooth=0.1,  # Added for better generalization
+                    path_smooth=0.05,  # Reduced for better pattern capture
                     random_state=DEFAULT_RANDOM_STATE,
                     verbose=-1,
                     importance_type='gain'
@@ -1346,12 +1347,12 @@ class EnhancedLoadForecaster:
             try:
                 # First fallback: HistGradientBoostingRegressor with optimized params
                 hgb_model = HistGradientBoostingRegressor(
-                    max_depth=7,  # Increased depth
-                    learning_rate=0.025,  # Slightly reduced for stability
-                    max_iter=1500,  # Increased iterations
-                    min_samples_leaf=30,  # Added for better generalization
-                    l2_regularization=5.0,  # Added regularization
-                    max_leaf_nodes=45,  # Added for better control
+                    max_depth=8,  # Increased depth for better patterns
+                    learning_rate=0.020,  # Reduced for better generalization
+                    max_iter=2000,  # Increased iterations
+                    min_samples_leaf=20,  # Reduced for better fit
+                    l2_regularization=3.0,  # Reduced regularization for better fit
+                    max_leaf_nodes=55,  # Increased for better expressiveness
                     random_state=DEFAULT_RANDOM_STATE
                 )
                 hgb_model.fit(X_unscaled[lgb_features], y, sample_weight=train_weights)
@@ -1367,13 +1368,13 @@ class EnhancedLoadForecaster:
             try:
                 # Second fallback: GradientBoostingRegressor with optimized params
                 gb_model = GradientBoostingRegressor(
-                    n_estimators=1200,  # Increased iterations
-                    learning_rate=0.025,  # Slightly reduced for stability
-                    max_depth=4,  # Increased depth
-                    min_samples_leaf=25,  # Added for better generalization
-                    min_samples_split=50,  # Added for better generalization
-                    subsample=0.8,
-                    max_features=0.75,  # Added feature subsampling
+                    n_estimators=1500,  # Increased iterations for better learning
+                    learning_rate=0.020,  # Reduced for better generalization
+                    max_depth=5,  # Increased depth for better patterns
+                    min_samples_leaf=18,  # Reduced for better fit
+                    min_samples_split=40,  # Reduced for better fit
+                    subsample=0.85,  # Increased for better generalization
+                    max_features=0.80,  # Increased feature utilization
                     random_state=DEFAULT_RANDOM_STATE
                 )
                 gb_model.fit(X_unscaled[lgb_features], y.values if hasattr(y, 'values') else y, sample_weight=train_weights)
@@ -1404,18 +1405,18 @@ class EnhancedLoadForecaster:
             resid_series = (train["Average_Load"] - train["RJPP"]).dropna()
             if len(resid_series):
                 try:
-                    # Optimized SARIMAX for residual mode with better specification
+                    # Optimized SARIMAX for residual mode with stronger seasonal specification
                     sarimax_model = SARIMAX(
                         resid_series,
-                        order=(1, 0, 1),  # Added MA term for better residual capture
-                        seasonal_order=(1, 1, 1, 12),  # Added seasonal AR for better patterns
+                        order=(2, 0, 1),  # Increased AR order for better pattern capture
+                        seasonal_order=(2, 1, 1, 12),  # Increased seasonal AR for stronger patterns
                         trend="n",
                         enforce_stationarity=False,
                         enforce_invertibility=False,
                         initialization='approximate_diffuse',  # Better initialization
                         concentrate_scale=True  # Improve estimation efficiency
-                    ).fit(disp=False, maxiter=200, method='lbfgs')  # Better optimization
-                    impl = "SARIMAX-resid(1,0,1)x(1,1,1,12) optimized"
+                    ).fit(disp=False, maxiter=250, method='lbfgs')  # Better optimization
+                    impl = "SARIMAX-resid(2,0,1)x(2,1,1,12) optimized"
                     self._register_model("SARIMAX", sarimax_model, impl, "ok", "non_iterative")
                     self.model_output_mode["SARIMAX"] = "residual"
                     self.residual_model_keys.add("SARIMAX")
@@ -1426,18 +1427,18 @@ class EnhancedLoadForecaster:
             try:
                 level_series = train["Average_Load"].astype(float).dropna()
                 exog = train["RJPP"].astype(float).reindex(level_series.index) if "RJPP" in train.columns else None
-                # Optimized SARIMAX for level mode with better specification
+                # Optimized SARIMAX for level mode with stronger seasonal specification
                 sarimax_model = SARIMAX(
                     level_series,
-                    order=(1, 1, 1),  # Added MA term for better fit
-                    seasonal_order=(1, 1, 1, 12),
+                    order=(2, 1, 1),  # Increased AR order for better pattern capture
+                    seasonal_order=(2, 1, 1, 12),  # Increased seasonal AR for stronger patterns
                     exog=exog,
                     enforce_stationarity=False,
                     enforce_invertibility=False,
                     initialization='approximate_diffuse',  # Better initialization
                     concentrate_scale=True  # Improve estimation efficiency
-                ).fit(disp=False, maxiter=200, method='lbfgs')  # Better optimization
-                impl = "SARIMAX(1,1,1)x(1,1,1,12) optimized" + (" with RJPP" if exog is not None else "")
+                ).fit(disp=False, maxiter=250, method='lbfgs')  # Better optimization
+                impl = "SARIMAX(2,1,1)x(2,1,1,12) optimized" + (" with RJPP" if exog is not None else "")
                 self._register_model("SARIMAX", sarimax_model, impl, "ok", "non_iterative")
                 self.model_output_mode["SARIMAX"] = "level"
                 self.residual_model_keys.discard("SARIMAX")
@@ -2063,16 +2064,20 @@ class EnhancedLoadForecaster:
             if not np.isfinite(sigma_model) or sigma_model <= 1e-9 or not np.isfinite(sigma_true):
                 alpha = 1.0
             else:
-                # Improved alpha bounds for better calibration: allow wider range
-                alpha = float(np.clip(sigma_true / sigma_model, 0.75, 1.25))
+                # Improved alpha bounds for better calibration: allow wider range for better fit
+                alpha = float(np.clip(sigma_true / sigma_model, 0.65, 1.35))
             
             adjusted_resid = pred_resid.loc[mask] * alpha
-            bias = float(adjusted_resid.mean()) if len(adjusted_resid) else 0.0
+            bias_raw = float(adjusted_resid.mean()) if len(adjusted_resid) else 0.0
             
-            # Apply bounds to bias to prevent extreme corrections
+            # Apply bounds to bias to prevent extreme corrections, but soften for fluctuation preservation
             bias_std = float(np.nanstd(adjusted_resid)) if len(adjusted_resid) else 0.0
-            if abs(bias) > 2.0 * bias_std and bias_std > 0:
-                bias = np.sign(bias) * 2.0 * bias_std  # Cap bias at 2 standard deviations
+            if abs(bias_raw) > 2.0 * bias_std and bias_std > 0:
+                bias_capped = np.sign(bias_raw) * 2.0 * bias_std  # Cap bias at 2 standard deviations
+            else:
+                bias_capped = bias_raw
+            # Soften bias correction to preserve more pattern variation
+            bias = 0.75 * bias_capped  # Apply only 75% of bias correction
             
             self.model_calibrations[model_name] = {"scale": alpha, "bias": bias}
             calibrated = (pred_resid * alpha) - bias
@@ -2097,16 +2102,16 @@ class EnhancedLoadForecaster:
             
             if rmse and np.isfinite(rmse) and mae and np.isfinite(mae):
                 # Combined metric: weighted average of RMSE and MAE, penalized by deviation and bias
-                # RMSE gets 60% weight, MAE gets 40% for better balance
-                combined_error = 0.6 * rmse + 0.4 * mae
-                # Penalize deviation from RJPP (if applicable) and bias
-                penalty = 1.0 + (dev / 100.0) + (bias / 200.0)  # Bias has half the weight of deviation
+                # RMSE gets 55% weight, MAE gets 45% for better balance
+                combined_error = 0.55 * rmse + 0.45 * mae
+                # Penalize deviation from RJPP (if applicable) and bias - stronger penalties for alignment
+                penalty = 1.0 + (dev / 60.0) + (bias / 120.0)  # Increased penalty weights
                 adjusted[k] = combined_error * penalty
         
         if not adjusted: return {k:1/len(keys) for k in keys}
         
         # Optimized temperature for better weight distribution
-        temperature = 0.65  # Slightly reduced for more decisive weighting
+        temperature = 0.70  # Slightly increased for smoother ensemble
         scores = {k: (1.0/adj)**temperature for k, adj in adjusted.items() if adj>0}
         if not scores:
             return {k:1/len(keys) for k in keys}
@@ -2115,8 +2120,8 @@ class EnhancedLoadForecaster:
         weights = {k: scores[k]/total for k in scores}
         
         # Improved floor and ceiling for better weight distribution
-        min_weight = 0.03  # Minimum weight per model (3%)
-        max_weight = 0.45  # Maximum weight per model (45%) to prevent dominance
+        min_weight = 0.04  # Minimum weight per model (4%)
+        max_weight = 0.40  # Maximum weight per model (40%) to prevent dominance
         
         # Apply floor
         floor = min_weight
@@ -2136,11 +2141,11 @@ class EnhancedLoadForecaster:
         bucket_metrics: {model_name: DataFrame with columns [bucket, RMSE, RJPP_dev%, Bias%, ...]}
         Returns: {bucket: {model: weight}}
         """
-        # Optimized penalty weights for better model selection
-        LAMBDA_DEV = 0.8   # penalty on absolute deviation vs RJPP (reduced for better balance)
-        LAMBDA_BIAS = 0.4  # penalty on signed bias vs RJPP (reduced for better balance)
+        # Optimized penalty weights for better model selection with stronger RJPP alignment
+        LAMBDA_DEV = 1.2   # increased penalty on absolute deviation vs RJPP for better alignment
+        LAMBDA_BIAS = 0.6  # increased penalty on signed bias vs RJPP
         LAMBDA_MAE = 0.3   # weight for MAE in addition to RMSE
-        MAX_W = 0.50       # prevent any single model from dominating a bucket (reduced from 0.55)
+        MAX_W = 0.50       # prevent any single model from dominating a bucket
         MIN_W = 0.02       # minimum weight per model per bucket
         bucket_rmse: Dict[str, Dict[str, List[float]]] = {}
 
@@ -2162,8 +2167,8 @@ class EnhancedLoadForecaster:
                 bias_series = df_bucket.get("Bias%", pd.Series(index=df_bucket.index, dtype=float)).fillna(0.0).abs()
                 
                 # Improved composite error metric combining RMSE, MAE, deviation, and bias
-                # RMSE (60%) + MAE (30%) weighted combination with penalty terms
-                base_error = 0.6 * rmse_values + 0.3 * mae_values
+                # RMSE (55%) + MAE (40%) weighted combination with penalty terms for better balance
+                base_error = 0.55 * rmse_values + 0.40 * mae_values
                 adj = base_error * (
                     1.0
                     + LAMBDA_DEV * np.clip(dev_series.to_numpy(dtype=float), 0, None) / 100.0
@@ -2637,9 +2642,11 @@ class EnhancedLoadForecaster:
             if not (np.isfinite(e_mean) and np.isfinite(r_mean) and r_mean > 0 and e_mean > 0):
                 continue
             k = r_mean / e_mean
-            k = float(np.clip(k, 1 - tolerance, 1 + tolerance))
-            result.loc[mask] = result.loc[mask] * k
-            logger.info(f"Annual scaler for {year}: k={k:.4f}")
+            # Apply scaler but preserve monthly fluctuations better by using softer bounds
+            k_soft = 0.7 * k + 0.3 * 1.0  # Blend toward no scaling for fluctuation preservation
+            k_soft = float(np.clip(k_soft, 1 - tolerance, 1 + tolerance))
+            result.loc[mask] = result.loc[mask] * k_soft
+            logger.info(f"Annual scaler for {year}: k={k:.4f}, applied={k_soft:.4f}")
         return result
 
     def _apply_rjpp_guards_vec(self, ensemble: pd.Series, rjpp: pd.Series) -> pd.Series:
