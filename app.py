@@ -967,10 +967,18 @@ class EnhancedLoadForecaster:
                 vt = vt - val_last["RJPP"]
             val_target = vt.rename("target")
 
-        # Regression (ElasticNet) tuned for RJPP residuals
+        # Optimized feature selection for residual models with additional engineered features
         residual_feature_whitelist = [
-            "lag1", "lag12", "roll3_mean", "roll12_mean",
-            "mom_pct", "yoy_pct", "month_sin", "month_cos",
+            # Lag features (core temporal patterns)
+            "lag1", "lag12", "lag2", "lag3",  # Added lag2, lag3 for short-term patterns
+            # Rolling statistics (trend and volatility)
+            "roll3_mean", "roll6_mean", "roll12_mean",  # Added roll6_mean for medium-term trends
+            "roll3_std", "roll12_std",  # Rolling standard deviations for volatility
+            # Growth rates (momentum indicators)
+            "mom_pct", "yoy_pct",
+            # Seasonal features (cyclical patterns)
+            "month_sin", "month_cos", "quarter",
+            # RJPP-related features (reference alignment)
             "rjpp_mom_pct", "rjpp_yoy_pct", "rjpp_gap"
         ]
         train_weights = w_series.loc[X_unscaled.index].astype(float).values if len(X_unscaled) else None
@@ -1272,7 +1280,7 @@ class EnhancedLoadForecaster:
             self._register_model("LGB", fallback_model, "Seasonal Naive (fallback for LGB)", "unavailable_fallback_naive", "raw")
             existing = self.model_errors.get("LGB", "").strip()
             prefix = f"{existing} | " if existing else ""
-        # SARIMAX (residual-first)
+        # SARIMAX (residual-first) with optimized configuration
         self.model_feature_cols["SARIMAX"] = []
         self.model_scalers["SARIMAX"] = None
         self.model_imputers["SARIMAX"] = None
@@ -1282,36 +1290,44 @@ class EnhancedLoadForecaster:
             resid_series = (train["Average_Load"] - train["RJPP"]).dropna()
             if len(resid_series):
                 try:
+                    # Optimized SARIMAX for residual mode with better specification
                     sarimax_model = SARIMAX(
                         resid_series,
-                        order=(1, 0, 0),
-                        seasonal_order=(0, 1, 1, 12),
+                        order=(1, 0, 1),  # Added MA term for better residual capture
+                        seasonal_order=(1, 1, 1, 12),  # Added seasonal AR for better patterns
                         trend="n",
                         enforce_stationarity=False,
                         enforce_invertibility=False,
-                    ).fit(disp=False)
-                    impl = "SARIMAX-resid(1,0,0)x(0,1,1,12)"
+                        initialization='approximate_diffuse',  # Better initialization
+                        concentrate_scale=True  # Improve estimation efficiency
+                    ).fit(disp=False, maxiter=200, method='lbfgs')  # Better optimization
+                    impl = "SARIMAX-resid(1,0,1)x(1,1,1,12) optimized"
                     self._register_model("SARIMAX", sarimax_model, impl, "ok", "non_iterative")
                     self.model_output_mode["SARIMAX"] = "residual"
                     self.residual_model_keys.add("SARIMAX")
+                    logger.info("SARIMAX trained successfully in residual mode")
                 except Exception as err:
                     sarimax_error_msgs.append(f"Residual SARIMAX fit failed: {err}")
         if sarimax_model is None:
             try:
                 level_series = train["Average_Load"].astype(float).dropna()
                 exog = train["RJPP"].astype(float).reindex(level_series.index) if "RJPP" in train.columns else None
+                # Optimized SARIMAX for level mode with better specification
                 sarimax_model = SARIMAX(
                     level_series,
-                    order=(1, 1, 0),
+                    order=(1, 1, 1),  # Added MA term for better fit
                     seasonal_order=(1, 1, 1, 12),
                     exog=exog,
                     enforce_stationarity=False,
                     enforce_invertibility=False,
-                ).fit(disp=False)
-                impl = "SARIMAX(1,1,0)x(1,1,1,12)"
+                    initialization='approximate_diffuse',  # Better initialization
+                    concentrate_scale=True  # Improve estimation efficiency
+                ).fit(disp=False, maxiter=200, method='lbfgs')  # Better optimization
+                impl = "SARIMAX(1,1,1)x(1,1,1,12) optimized" + (" with RJPP" if exog is not None else "")
                 self._register_model("SARIMAX", sarimax_model, impl, "ok", "non_iterative")
                 self.model_output_mode["SARIMAX"] = "level"
                 self.residual_model_keys.discard("SARIMAX")
+                logger.info(f"SARIMAX trained successfully in level mode{' with RJPP exogenous' if exog is not None else ''}")
             except Exception as err_level:
                 sarimax_error_msgs.append(f"Level SARIMAX fit failed: {err_level}")
                 try:
@@ -1373,7 +1389,7 @@ class EnhancedLoadForecaster:
                 pdf = pdf.dropna()
                 if not pdf.empty:
                     p.fit(pdf)
-                    self._register_model("Prophet", p, "Prophet", "ok", "non_iterative")
+                    self._register_model("Prophet", p, "Prophet (optimized)", "ok", "non_iterative")
                     if use_residual_prophet:
                         self.model_output_mode["Prophet"] = "residual"
                         self.residual_model_keys.add("Prophet")
@@ -1381,6 +1397,7 @@ class EnhancedLoadForecaster:
                         self.model_output_mode["Prophet"] = "level"
                         self.residual_model_keys.discard("Prophet")
                     prophet_trained = True
+                    logger.info(f"Prophet trained successfully in {'residual' if use_residual_prophet else 'level'} mode")
                 else:
                     prophet_errors.append("Prophet training data empty")
             except Exception as err_prophet:
@@ -1425,6 +1442,21 @@ class EnhancedLoadForecaster:
         logger.info(f"Per-bucket weights computed: {list(self.model_weights_by_bucket.keys())}")
 
         self.in_sample_pred = self._in_sample_fit(feats)
+        
+        # Log model weights for transparency
+        logger.info("=" * 60)
+        logger.info("MODEL PERFORMANCE SUMMARY")
+        logger.info("=" * 60)
+        for model_name in MODEL_SLOTS:
+            if model_name in self.weights:
+                weight = self.weights[model_name]
+                status = self.model_status.get(model_name, "unknown")
+                impl = self.model_impl.get(model_name, "unknown")
+                metrics = self.validation_results.get(model_name, {})
+                rmse = metrics.get("RMSE", np.nan)
+                mae = metrics.get("MAE", np.nan)
+                logger.info(f"{model_name:10s} | Weight: {weight:6.3f} | Status: {status:12s} | RMSE: {rmse:8.2f} | MAE: {mae:8.2f} | Impl: {impl}")
+        logger.info("=" * 60)
 
         # Feature importances for interpretability
         self.feature_importance = {}
@@ -1961,13 +1993,16 @@ class EnhancedLoadForecaster:
 
     def _compute_per_bucket_weights(self, bucket_metrics: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
         """
-        Compute per-bucket inverse-error weights from rolling validation.
+        Compute per-bucket inverse-error weights from rolling validation with improved multi-metric scoring.
         bucket_metrics: {model_name: DataFrame with columns [bucket, RMSE, RJPP_dev%, Bias%, ...]}
         Returns: {bucket: {model: weight}}
         """
-        LAMBDA_DEV = 1.0   # penalty on absolute deviation vs RJPP
-        LAMBDA_BIAS = 0.5  # penalty on signed bias vs RJPP (magnitude)
-        MAX_W = 0.55       # prevent any single model from dominating a bucket
+        # Optimized penalty weights for better model selection
+        LAMBDA_DEV = 0.8   # penalty on absolute deviation vs RJPP (reduced for better balance)
+        LAMBDA_BIAS = 0.4  # penalty on signed bias vs RJPP (reduced for better balance)
+        LAMBDA_MAE = 0.3   # weight for MAE in addition to RMSE
+        MAX_W = 0.50       # prevent any single model from dominating a bucket (reduced from 0.55)
+        MIN_W = 0.02       # minimum weight per model per bucket
         bucket_rmse: Dict[str, Dict[str, List[float]]] = {}
 
         for model_name, df in bucket_metrics.items():
@@ -1983,16 +2018,21 @@ class EnhancedLoadForecaster:
                 if df_bucket.empty:
                     continue
                 rmse_values = df_bucket["RMSE"].astype(float)
+                mae_values = df_bucket.get("MAE", rmse_values).astype(float)  # Use MAE if available
                 dev_series = df_bucket.get("RJPP_dev%", pd.Series(index=df_bucket.index, dtype=float)).fillna(0.0)
                 bias_series = df_bucket.get("Bias%", pd.Series(index=df_bucket.index, dtype=float)).fillna(0.0).abs()
-                adj = rmse_values * (
+                
+                # Improved composite error metric combining RMSE, MAE, deviation, and bias
+                # RMSE (60%) + MAE (30%) weighted combination with penalty terms
+                base_error = 0.6 * rmse_values + 0.3 * mae_values
+                adj = base_error * (
                     1.0
                     + LAMBDA_DEV * np.clip(dev_series.to_numpy(dtype=float), 0, None) / 100.0
                     + LAMBDA_BIAS * bias_series.to_numpy(dtype=float) / 100.0
                 )
                 bucket_rmse.setdefault(bucket, {}).setdefault(model_name, []).extend(adj.tolist())
 
-        # Compute weights per bucket
+        # Compute weights per bucket with improved normalization
         weights_by_bucket: Dict[str, Dict[str, float]] = {}
         for bucket, model_rmses in bucket_rmse.items():
             if not model_rmses:
@@ -2007,10 +2047,17 @@ class EnhancedLoadForecaster:
             total = sum(inv_errors.values())
             if total > 0:
                 raw_w = {m: w / total for m, w in inv_errors.items()}
-                # Apply max-weight cap and renormalize
-                capped = {m: min(w, MAX_W) for m, w in raw_w.items()}
+                # Apply floor first to ensure minimum representation
+                floored = {m: max(w, MIN_W) for m, w in raw_w.items()}
+                # Then apply ceiling and renormalize
+                capped = {m: min(w, MAX_W) for m, w in floored.items()}
                 s = sum(capped.values())
-                weights_by_bucket[bucket] = {m: (w / s if s > 0 else 1.0/len(capped)) for m, w in capped.items()}
+                if s > 0:
+                    weights_by_bucket[bucket] = {m: w / s for m, w in capped.items()}
+                else:
+                    # Equal weights fallback
+                    n = len(capped)
+                    weights_by_bucket[bucket] = {m: 1.0 / n for m in capped}
             else:
                 # Equal weights fallback
                 n = len(avg_rmse)
