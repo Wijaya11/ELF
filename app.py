@@ -1458,21 +1458,29 @@ class EnhancedLoadForecaster:
                 logger.info(f"{model_name:10s} | Weight: {weight:6.3f} | Status: {status:12s} | RMSE: {rmse:8.2f} | MAE: {mae:8.2f} | Impl: {impl}")
         logger.info("=" * 60)
 
-        # Feature importances for interpretability
+        # Feature importances for interpretability with logging
         self.feature_importance = {}
+        logger.info("Computing feature importances...")
         if "RF" in self.models and hasattr(self.models.get("RF"), "feature_importances_"):
             cols = self.model_feature_cols.get("RF", self.feature_cols)
             self.feature_importance["RF"] = dict(zip(cols, self.models["RF"].feature_importances_.tolist()))
+            # Log top 5 features
+            top_features = sorted(self.feature_importance["RF"].items(), key=lambda x: x[1], reverse=True)[:5]
+            logger.info(f"RF top features: {', '.join([f'{k}({v:.3f})' for k, v in top_features])}")
         if "XGB" in self.models:
             imp = getattr(self.models.get("XGB"), "feature_importances_", None)
             if imp is not None:
                 cols = self.model_feature_cols.get("XGB", self.feature_cols)
                 self.feature_importance["XGB"] = dict(zip(cols, imp.tolist()))
+                top_features = sorted(self.feature_importance["XGB"].items(), key=lambda x: x[1], reverse=True)[:5]
+                logger.info(f"XGB top features: {', '.join([f'{k}({v:.3f})' for k, v in top_features])}")
         if "LGB" in self.models:
             imp = getattr(self.models.get("LGB"), "feature_importances_", None)
             if imp is not None:
                 cols = self.model_feature_cols.get("LGB", self.feature_cols)
                 self.feature_importance["LGB"] = dict(zip(cols, imp.tolist()))
+                top_features = sorted(self.feature_importance["LGB"].items(), key=lambda x: x[1], reverse=True)[:5]
+                logger.info(f"LGB top features: {', '.join([f'{k}({v:.3f})' for k, v in top_features])}")
 
         # Meta-ensemble on validation residuals with optimized configuration
         self.meta_model = None
@@ -1909,7 +1917,7 @@ class EnhancedLoadForecaster:
         return agg, last_preds, last_idx, per_window_metrics_dfs
 
     def _calibrate_residual_models(self) -> None:
-        """Apply amplitude and bias calibration to residual-mode models."""
+        """Apply improved amplitude and bias calibration to residual-mode models."""
         self.model_calibrations = {}
         if not self._residualize_effective or not self.val_preds or self.val_index is None:
             return
@@ -1919,6 +1927,7 @@ class EnhancedLoadForecaster:
         actual_level = self.val_df["Average_Load"].reindex(self.val_index).astype(float)
         actual_resid = (actual_level - rjpp_val)
 
+        logger.info("Calibrating residual models...")
         for model_name, preds in list(self.val_preds.items()):
             if model_name not in self.residual_model_keys:
                 continue
@@ -1931,18 +1940,34 @@ class EnhancedLoadForecaster:
             pred_resid = pred_series - rjpp_val
             mask = pred_resid.notna() & actual_resid.notna()
             if mask.sum() < 3:
+                logger.debug(f"{model_name}: Insufficient data for calibration (n={mask.sum()})")
                 continue
+            
+            # Compute calibration parameters with improved bounds
             sigma_model = float(np.nanstd(pred_resid.loc[mask], ddof=0))
             sigma_true = float(np.nanstd(actual_resid.loc[mask], ddof=0))
             if not np.isfinite(sigma_model) or sigma_model <= 1e-9 or not np.isfinite(sigma_true):
                 alpha = 1.0
             else:
-                alpha = float(np.clip(sigma_true / sigma_model, 0.8, 1.1))
+                # Improved alpha bounds for better calibration: allow wider range
+                alpha = float(np.clip(sigma_true / sigma_model, 0.75, 1.25))
+            
             adjusted_resid = pred_resid.loc[mask] * alpha
             bias = float(adjusted_resid.mean()) if len(adjusted_resid) else 0.0
+            
+            # Apply bounds to bias to prevent extreme corrections
+            bias_std = float(np.nanstd(adjusted_resid)) if len(adjusted_resid) else 0.0
+            if abs(bias) > 2.0 * bias_std and bias_std > 0:
+                bias = np.sign(bias) * 2.0 * bias_std  # Cap bias at 2 standard deviations
+            
             self.model_calibrations[model_name] = {"scale": alpha, "bias": bias}
             calibrated = (pred_resid * alpha) - bias
             self.val_preds[model_name] = calibrated.add(rjpp_val, fill_value=0.0).reindex(self.val_index)
+            
+            # Log calibration details
+            pre_rmse = _rmse(actual_resid.loc[mask], pred_resid.loc[mask])
+            post_rmse = _rmse(actual_resid.loc[mask], calibrated.loc[mask])
+            logger.info(f"{model_name:10s} | Scale: {alpha:6.3f} | Bias: {bias:8.2f} | RMSE: {pre_rmse:7.2f} → {post_rmse:7.2f} ({((post_rmse-pre_rmse)/pre_rmse*100):+.1f}%)")
 
     def _weights_from_validation(self, valres: Dict[str, Dict[str, float]]) -> Dict[str, float]:
         """Compute global inverse-error weights with improved multi-metric optimization."""
