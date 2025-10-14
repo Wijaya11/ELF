@@ -975,6 +975,7 @@ class EnhancedLoadForecaster:
         ]
         train_weights = w_series.loc[X_unscaled.index].astype(float).values if len(X_unscaled) else None
 
+        # Ridge/ElasticNet with optimized feature selection and hyperparameters
         ridge_features = [c for c in ["lag1", "lag12", "roll3_mean", "roll12_mean", "month_sin", "month_cos", "rjpp_mom_pct", "rjpp_yoy_pct", "rjpp_gap"] if c in X_unscaled.columns]
         ridge_model = None
         ridge_status = "unavailable"
@@ -986,18 +987,22 @@ class EnhancedLoadForecaster:
                 X_ridge_scaled = ridge_scaler.transform(X_unscaled[ridge_features])
                 cv = self._make_tscv(len(X_unscaled))
                 if cv is not None:
+                    # Optimized ElasticNetCV with expanded search space
                     enet = ElasticNetCV(
-                        l1_ratio=[0.1, 0.25, 0.5],
-                        alphas=np.logspace(-3, 1, 12),
+                        l1_ratio=[0.05, 0.1, 0.2, 0.3, 0.5, 0.7],  # Expanded l1_ratio search
+                        alphas=np.logspace(-3, 1.5, 15),  # Expanded alpha search range
                         cv=cv,
-                        max_iter=20000,
-                        random_state=DEFAULT_RANDOM_STATE
+                        max_iter=30000,  # Increased max iterations for convergence
+                        tol=1e-4,  # Added tolerance for better convergence
+                        selection='random',  # Use random selection for faster convergence
+                        random_state=DEFAULT_RANDOM_STATE,
+                        n_jobs=-1  # Parallelize CV
                     )
                     enet.fit(X_ridge_scaled, y.values, sample_weight=train_weights)
                     ridge_model = enet
-                    ridge_impl = "ElasticNetCV"
+                    ridge_impl = "ElasticNetCV (optimized)"
                 else:
-                    ridge_model = Ridge(alpha=1.0).fit(X_ridge_scaled, y.values, sample_weight=train_weights)
+                    ridge_model = Ridge(alpha=1.0, solver='auto').fit(X_ridge_scaled, y.values, sample_weight=train_weights)
                     ridge_impl = "Ridge(alpha=1.0)"
                 ridge_status = "ok"
             except Exception as e:
@@ -1026,7 +1031,7 @@ class EnhancedLoadForecaster:
         else:
             self._register_model("Ridge", None, ridge_impl, "unavailable", "linear")
 
-        # Random Forest (residual mode smoothing)
+        # Random Forest (residual mode smoothing) - Optimized hyperparameters
         rf_features = ([c for c in residual_feature_whitelist if c in X_unscaled.columns]
                        if self._residualize_effective else list(X_unscaled.columns))
         rf_model = None
@@ -1034,38 +1039,57 @@ class EnhancedLoadForecaster:
         rf_impl = "Unavailable"
         if rf_features and not X_unscaled.empty:
             try:
+                # Optimized RF hyperparameters for better performance
                 rf_model = RandomForestRegressor(
-                    n_estimators=900,
-                    max_depth=6,
-                    min_samples_leaf=12,
-                    min_samples_split=24,
-                    max_features=0.6,
+                    n_estimators=1000,  # Increased for better stability
+                    max_depth=7,  # Slightly deeper for better pattern capture
+                    min_samples_leaf=10,  # Reduced for better fit
+                    min_samples_split=20,  # Reduced for better fit
+                    max_features=0.65,  # Slightly increased feature subset
                     bootstrap=True,
-                    ccp_alpha=3e-4,
+                    ccp_alpha=2e-4,  # Reduced pruning for better fit
                     random_state=DEFAULT_RANDOM_STATE,
-                    n_jobs=-1
+                    n_jobs=-1,
+                    warm_start=False,
+                    oob_score=False
                 ).fit(X_unscaled[rf_features], y.values, sample_weight=train_weights)
                 rf_status = "ok"
-                rf_impl = "RandomForestRegressor"
+                rf_impl = "RandomForestRegressor (optimized)"
             except Exception as e:
                 self.model_errors["RF"] = f"RF failed: {e}"
                 try:
+                    # First fallback: Try ExtraTreesRegressor with optimized params
                     rf_model = ExtraTreesRegressor(
-                        n_estimators=900,
-                        max_depth=6,
-                        min_samples_leaf=12,
-                        min_samples_split=24,
-                        max_features=0.6,
+                        n_estimators=1000,
+                        max_depth=7,
+                        min_samples_leaf=10,
+                        min_samples_split=20,
+                        max_features=0.65,
                         random_state=DEFAULT_RANDOM_STATE,
-                        n_jobs=-1
+                        n_jobs=-1,
+                        bootstrap=False
                     ).fit(X_unscaled[rf_features], y.values, sample_weight=train_weights)
                     rf_status = "fallback"
                     rf_impl = "ExtraTreesRegressor (fallback)"
                 except Exception as e2:
-                    self.model_errors["RF"] += f" | ExtraTrees fallback failed: {e2}"
-                    rf_model = None
-                    rf_status = "unavailable"
-                    rf_impl = "Unavailable"
+                    self.model_errors["RF"] = self.model_errors.get("RF", "") + f" | ExtraTrees fallback failed: {e2}"
+                    # Second fallback: Try GradientBoostingRegressor as last resort
+                    try:
+                        rf_model = GradientBoostingRegressor(
+                            n_estimators=600,
+                            learning_rate=0.04,
+                            max_depth=4,
+                            min_samples_leaf=10,
+                            subsample=0.8,
+                            random_state=DEFAULT_RANDOM_STATE
+                        ).fit(X_unscaled[rf_features], y.values, sample_weight=train_weights)
+                        rf_status = "fallback"
+                        rf_impl = "GradientBoostingRegressor (2nd fallback for RF)"
+                    except Exception as e3:
+                        self.model_errors["RF"] = self.model_errors.get("RF", "") + f" | GradientBoosting fallback failed: {e3}"
+                        rf_model = None
+                        rf_status = "unavailable"
+                        rf_impl = "Unavailable"
         self.model_feature_cols["RF"] = rf_features
         self.model_scalers["RF"] = None
         self.model_imputers["RF"] = X_unscaled[rf_features].median(numeric_only=True) if rf_features else pd.Series(dtype=float)
@@ -1096,37 +1120,43 @@ class EnhancedLoadForecaster:
                     fit_kwargs["early_stopping_rounds"] = 50
             try:
                 if xgb_features and not X_unscaled.empty:
+                    # Optimized XGBoost hyperparameters for better performance
                     xgb_model = XGBRegressor(
-                        n_estimators=1200,
-                        learning_rate=0.03,
-                        max_depth=4,
-                        min_child_weight=8,
-                        subsample=0.7,
-                        colsample_bytree=0.7,
-                        reg_lambda=12.0,
-                        reg_alpha=2.0,
-                        gamma=0.5,
+                        n_estimators=1500,  # Increased for better learning
+                        learning_rate=0.025,  # Slightly reduced for stability
+                        max_depth=5,  # Increased depth for better pattern capture
+                        min_child_weight=6,  # Reduced for better fit
+                        subsample=0.75,  # Increased for better generalization
+                        colsample_bytree=0.75,  # Increased feature sampling
+                        reg_lambda=10.0,  # Slightly reduced L2 regularization
+                        reg_alpha=1.5,  # Slightly reduced L1 regularization
+                        gamma=0.3,  # Reduced for better split decisions
                         objective="reg:squarederror",
                         tree_method="hist",
                         random_state=DEFAULT_RANDOM_STATE,
-                        verbosity=0
+                        verbosity=0,
+                        importance_type='gain'
                     ).fit(X_unscaled[xgb_features].values, y.values, sample_weight=train_weights, **fit_kwargs)
-                    xgb_impl = "XGBRegressor"
+                    xgb_impl = "XGBRegressor (optimized)"
                     xgb_status = "ok"
             except Exception as e:
                 xgb_fallback_error = e
                 self.model_errors["XGB"] = f"XGB failed: {e}"
             if xgb_model is None and xgb_features and not X_unscaled.empty:
                 try:
+                    # Improved fallback with better hyperparameters
                     gbr_model = GradientBoostingRegressor(
-                        n_estimators=800,
-                        learning_rate=0.03,
-                        max_depth=3,
+                        n_estimators=1000,  # Increased iterations
+                        learning_rate=0.025,  # Slightly reduced for stability
+                        max_depth=4,  # Increased depth
+                        min_samples_leaf=8,  # Added for better generalization
+                        min_samples_split=16,  # Added for better generalization
                         subsample=0.8,
+                        max_features=0.7,  # Added feature subsampling
                         random_state=DEFAULT_RANDOM_STATE
                     ).fit(X_unscaled[xgb_features], y, sample_weight=train_weights)
                     xgb_model = gbr_model
-                    xgb_impl = "GradientBoostingRegressor (fallback)" if xgb_fallback_error else "GradientBoostingRegressor"
+                    xgb_impl = "GradientBoostingRegressor (optimized fallback)" if xgb_fallback_error else "GradientBoostingRegressor (optimized)"
                     xgb_status = "fallback" if xgb_fallback_error else "ok"
                 except Exception as e2:
                     self.model_errors["XGB"] = self.model_errors.get("XGB", "") + (" | " if xgb_fallback_error else "") + f"GradientBoosting fallback failed: {e2}"
@@ -1165,34 +1195,47 @@ class EnhancedLoadForecaster:
                     yv = val_target.loc[m]
                     if len(Xv):
                         fit_kwargs["eval_set"] = [(Xv.values, yv.values)]
+                # Optimized LightGBM hyperparameters for better performance
                 lgb_model = LGBMRegressor(
-                    n_estimators=4000,
-                    learning_rate=0.02,
-                    num_leaves=31,
-                    max_depth=6,
-                    min_data_in_leaf=40,
-                    feature_fraction=0.75,
-                    bagging_fraction=0.75,
+                    n_estimators=5000,  # Increased for better learning with early stopping
+                    learning_rate=0.018,  # Slightly reduced for better generalization
+                    num_leaves=40,  # Increased for better expressiveness
+                    max_depth=7,  # Increased depth for better pattern capture
+                    min_data_in_leaf=35,  # Slightly reduced for better fit
+                    feature_fraction=0.8,  # Increased for better feature utilization
+                    bagging_fraction=0.8,  # Increased for better generalization
                     bagging_freq=1,
-                    lambda_l1=0.1,
-                    lambda_l2=10.0,
+                    lambda_l1=0.08,  # Slightly reduced L1 regularization
+                    lambda_l2=8.0,  # Slightly reduced L2 regularization
                     min_gain_to_split=0.0,
+                    min_child_weight=0.001,  # Added for better control
+                    path_smooth=0.1,  # Added for better generalization
                     random_state=DEFAULT_RANDOM_STATE,
-                    verbose=-1
+                    verbose=-1,
+                    importance_type='gain'
                 )
                 lgb_model.fit(X_unscaled[lgb_features].values, y.values, sample_weight=train_weights, **fit_kwargs)
-                lgb_impl = "LGBMRegressor"
+                lgb_impl = "LGBMRegressor (optimized)"
                 lgb_status = "ok"
             except Exception as e:
                 self.model_errors["LGB"] = f"LGB failed: {e}"
                 lgb_model = None
         if lgb_model is None and lgb_features and not X_unscaled.empty:
             try:
-                hgb_model = HistGradientBoostingRegressor(max_depth=6, learning_rate=0.03, random_state=DEFAULT_RANDOM_STATE)
+                # First fallback: HistGradientBoostingRegressor with optimized params
+                hgb_model = HistGradientBoostingRegressor(
+                    max_depth=7,  # Increased depth
+                    learning_rate=0.025,  # Slightly reduced for stability
+                    max_iter=1500,  # Increased iterations
+                    min_samples_leaf=30,  # Added for better generalization
+                    l2_regularization=5.0,  # Added regularization
+                    max_leaf_nodes=45,  # Added for better control
+                    random_state=DEFAULT_RANDOM_STATE
+                )
                 hgb_model.fit(X_unscaled[lgb_features], y, sample_weight=train_weights)
                 lgb_model = hgb_model
                 prev_err = self.model_errors.get("LGB")
-                lgb_impl = "HistGradientBoostingRegressor (fallback)" if prev_err else "HistGradientBoostingRegressor"
+                lgb_impl = "HistGradientBoostingRegressor (optimized fallback)" if prev_err else "HistGradientBoostingRegressor (optimized)"
                 lgb_status = "fallback" if prev_err else "ok"
             except Exception as e2:
                 prev_err = self.model_errors.get("LGB")
@@ -1200,10 +1243,20 @@ class EnhancedLoadForecaster:
                 self.model_errors["LGB"] = f"{prev_err + ' | ' if prev_err else ''}{msg}"
         if lgb_model is None and lgb_features and not X_unscaled.empty:
             try:
-                gb_model = GradientBoostingRegressor(n_estimators=800, learning_rate=0.03, max_depth=3, subsample=0.8, random_state=DEFAULT_RANDOM_STATE)
+                # Second fallback: GradientBoostingRegressor with optimized params
+                gb_model = GradientBoostingRegressor(
+                    n_estimators=1200,  # Increased iterations
+                    learning_rate=0.025,  # Slightly reduced for stability
+                    max_depth=4,  # Increased depth
+                    min_samples_leaf=25,  # Added for better generalization
+                    min_samples_split=50,  # Added for better generalization
+                    subsample=0.8,
+                    max_features=0.75,  # Added feature subsampling
+                    random_state=DEFAULT_RANDOM_STATE
+                )
                 gb_model.fit(X_unscaled[lgb_features], y.values if hasattr(y, 'values') else y, sample_weight=train_weights)
                 lgb_model = gb_model
-                lgb_impl = "GradientBoostingRegressor (fallback)"
+                lgb_impl = "GradientBoostingRegressor (optimized 2nd fallback)"
                 lgb_status = "fallback"
             except Exception as e3:
                 prev_err = self.model_errors.get("LGB")
@@ -1287,14 +1340,17 @@ class EnhancedLoadForecaster:
             use_residual_prophet = self._residualize_effective and "RJPP" in train.columns
             try:
                 try:
+                    # Optimized Prophet configuration for better forecasting
                     p = Prophet(
                         yearly_seasonality=True,
                         weekly_seasonality=False,
                         daily_seasonality=False,
                         seasonality_mode="additive",
-                        n_changepoints=0,
-                        changepoint_prior_scale=0.01,
-                        growth="flat",
+                        n_changepoints=5,  # Increased from 0 for better trend capture
+                        changepoint_prior_scale=0.05,  # Increased for more flexibility
+                        seasonality_prior_scale=12.0,  # Increased for stronger seasonality
+                        growth="linear" if not use_residual_prophet else "flat",  # Linear growth for level, flat for residual
+                        changepoint_range=0.8,  # Focus changepoints on first 80% of data
                     )
                 except Exception:
                     p = Prophet(
@@ -1302,10 +1358,12 @@ class EnhancedLoadForecaster:
                         weekly_seasonality=False,
                         daily_seasonality=False,
                         seasonality_mode="additive",
-                        n_changepoints=0,
-                        changepoint_prior_scale=0.01,
+                        n_changepoints=5,
+                        changepoint_prior_scale=0.05,
+                        seasonality_prior_scale=12.0
                     )
-                p.add_seasonality(name="monthly", period=12.0, fourier_order=6)
+                # Optimized monthly seasonality with higher Fourier order for better fit
+                p.add_seasonality(name="monthly", period=12.0, fourier_order=8)
                 pdf = train.reset_index().rename(columns={"Date": "ds", "Average_Load": "y"})
                 if use_residual_prophet:
                     pdf["y"] = pdf["y"] - train["RJPP"].values
@@ -1384,7 +1442,7 @@ class EnhancedLoadForecaster:
                 cols = self.model_feature_cols.get("LGB", self.feature_cols)
                 self.feature_importance["LGB"] = dict(zip(cols, imp.tolist()))
 
-        # Meta-ensemble on validation residuals
+        # Meta-ensemble on validation residuals with optimized configuration
         self.meta_model = None
         self.meta_models_order = []
         if self.val_index is not None and self.val_preds:
@@ -1400,9 +1458,31 @@ class EnhancedLoadForecaster:
                 yv = self.val_df["Average_Load"].reindex(self.val_index) if isinstance(self.val_df, pd.DataFrame) else pd.Series(dtype=float)
                 mask = df_meta.notna().all(axis=1) & yv.notna()
                 if mask.sum() >= 4:
-                    self.meta_model = Ridge(alpha=1e-3, random_state=DEFAULT_RANDOM_STATE)
-                    self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
-                    self.meta_models_order = common
+                    # Optimized meta-model: ElasticNetCV for better model combination
+                    try:
+                        # Try ElasticNetCV for optimal blending
+                        cv_meta = self._make_tscv(mask.sum())
+                        if cv_meta is not None:
+                            self.meta_model = ElasticNetCV(
+                                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
+                                alphas=np.logspace(-4, 0, 12),
+                                cv=cv_meta,
+                                max_iter=10000,
+                                positive=True,  # Ensure positive weights for interpretability
+                                random_state=DEFAULT_RANDOM_STATE,
+                                n_jobs=-1
+                            )
+                            self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
+                        else:
+                            # Fallback to Ridge with very light regularization
+                            self.meta_model = Ridge(alpha=1e-3, positive=True, random_state=DEFAULT_RANDOM_STATE)
+                            self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
+                        self.meta_models_order = common
+                    except Exception as meta_err:
+                        logger.warning(f"Meta-model training with ElasticNetCV failed: {meta_err}, using Ridge fallback")
+                        self.meta_model = Ridge(alpha=1e-3, random_state=DEFAULT_RANDOM_STATE)
+                        self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
+                        self.meta_models_order = common
 
 
 
@@ -1833,25 +1913,50 @@ class EnhancedLoadForecaster:
             self.val_preds[model_name] = calibrated.add(rjpp_val, fill_value=0.0).reindex(self.val_index)
 
     def _weights_from_validation(self, valres: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-        """Compute global inverse-error weights (for backward compatibility)."""
+        """Compute global inverse-error weights with improved multi-metric optimization."""
         keys = [k for k in valres if k!="Naive"]
         if not keys: return {}
         adjusted = {}
         for k in keys:
-            v = valres[k]; rmse=v.get("RMSE"); dev=v.get("RJPP_dev%") or 0
-            if rmse and np.isfinite(rmse):
-                adjusted[k]=rmse*(1+dev/100)
+            v = valres[k]
+            rmse = v.get("RMSE")
+            mae = v.get("MAE", rmse)  # Use MAE if available, else RMSE
+            dev = v.get("RJPP_dev%") or 0
+            bias = abs(v.get("Bias%", 0))  # Consider bias magnitude
+            
+            if rmse and np.isfinite(rmse) and mae and np.isfinite(mae):
+                # Combined metric: weighted average of RMSE and MAE, penalized by deviation and bias
+                # RMSE gets 60% weight, MAE gets 40% for better balance
+                combined_error = 0.6 * rmse + 0.4 * mae
+                # Penalize deviation from RJPP (if applicable) and bias
+                penalty = 1.0 + (dev / 100.0) + (bias / 200.0)  # Bias has half the weight of deviation
+                adjusted[k] = combined_error * penalty
+        
         if not adjusted: return {k:1/len(keys) for k in keys}
-        temperature = 0.7
+        
+        # Optimized temperature for better weight distribution
+        temperature = 0.65  # Slightly reduced for more decisive weighting
         scores = {k: (1.0/adj)**temperature for k, adj in adjusted.items() if adj>0}
         if not scores:
             return {k:1/len(keys) for k in keys}
+        
         total = sum(scores.values())
         weights = {k: scores[k]/total for k in scores}
-        floor = 0.05/len(weights)
+        
+        # Improved floor and ceiling for better weight distribution
+        min_weight = 0.03  # Minimum weight per model (3%)
+        max_weight = 0.45  # Maximum weight per model (45%) to prevent dominance
+        
+        # Apply floor
+        floor = min_weight
         weights = {k: max(w, floor) for k, w in weights.items()}
+        
+        # Apply ceiling and renormalize
+        weights = {k: min(w, max_weight) for k, w in weights.items()}
         total = sum(weights.values())
-        weights = {k: w/total for k, w in weights.items()}
+        if total > 0:
+            weights = {k: w/total for k, w in weights.items()}
+        
         return weights
 
     def _compute_per_bucket_weights(self, bucket_metrics: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
