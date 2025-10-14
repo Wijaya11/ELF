@@ -3060,18 +3060,35 @@ def shaded(fig, start_x, end_x): fig.add_vrect(x0=start_x, x1=end_x, fillcolor="
 def plot_hero(combined, fc, rjpp_full, key_suffix="", show_bands: bool = True, bounded: bool = False, max_dev: Optional[float] = None, fc_adj: Optional[pd.DataFrame] = None, combined_adj: Optional[pd.Series] = None, planned_overlay: Optional[pd.Series] = None, label_base: str = "Base", label_adj: str = "Scenario-Adjusted", forecast_start: Optional[pd.Timestamp] = None):
     fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
     shade_start = fc.index.min() if len(fc.index) else None
-    if shade_start is not None:
-        shaded(fig, shade_start, fc.index.max())
 
     expected_start = None
     if forecast_start is not None:
         expected_start = pd.to_datetime(forecast_start).to_period("M").to_timestamp()
-    if expected_start is not None and shade_start is not None:
-        if shade_start != expected_start:
-            st.warning(f"Forecast start misalignment detected at {shade_start:%Y-%m}; expected {expected_start:%Y-%m}")
-        assert shade_start == expected_start, (
-            f"Forecast begins at {shade_start:%Y-%m}; expected {expected_start:%Y-%m}."
+    if expected_start is not None and shade_start is not None and shade_start != expected_start:
+        warning_msg = (
+            f"Forecast start misalignment detected at {shade_start:%Y-%m}; expected {expected_start:%Y-%m}"
         )
+        st.warning(warning_msg)
+        logger.warning(warning_msg)
+        logger.debug(
+            "plot_hero start misalignment | shade_start=%s expected_start=%s fc_start=%s fc_end=%s len=%s",
+            shade_start,
+            expected_start,
+            fc.index.min() if len(fc.index) else None,
+            fc.index.max() if len(fc.index) else None,
+            len(fc.index),
+        )
+        if expected_start in fc.index:
+            shade_start = expected_start
+        else:
+            logger.debug(
+                "expected_start %s not found in forecast index; proceeding with available start %s",
+                expected_start,
+                shade_start,
+            )
+
+    if shade_start is not None:
+        shaded(fig, shade_start, fc.index.max())
 
     base_col = "p50" if "p50" in fc.columns else ("Ensemble" if "Ensemble" in fc.columns else None)
     base_series = fc[base_col].astype(float) if base_col is not None else pd.Series(dtype=float)
