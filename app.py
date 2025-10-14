@@ -951,10 +951,19 @@ class EnhancedLoadForecaster:
         f["quarter"] = f.index.quarter
         f["quarter_sin"] = np.sin(2*np.pi*f["quarter"]/4)
         f["quarter_cos"] = np.cos(2*np.pi*f["quarter"]/4)
-        for lag in [1,12]:
+        # Core lag structure (short-, medium-, and seasonal memory)
+        for lag in [1, 2, 3, 6, 12]:
             f[f"lag{lag}"] = f["Average_Load"].shift(lag)
+
+        # Rolling statistics capture trend and volatility regimes
         f["roll3_mean"] = f["Average_Load"].rolling(window=3, min_periods=1).mean().shift(1)
+        f["roll6_mean"] = f["Average_Load"].rolling(window=6, min_periods=1).mean().shift(1)
         f["roll12_mean"] = f["Average_Load"].rolling(window=12, min_periods=1).mean().shift(1)
+        f["roll3_std"] = f["Average_Load"].rolling(window=3, min_periods=2).std().shift(1)
+        f["roll6_std"] = f["Average_Load"].rolling(window=6, min_periods=3).std().shift(1)
+        f["roll12_std"] = f["Average_Load"].rolling(window=12, min_periods=6).std().shift(1)
+
+        # Momentum style rates of change
         f["mom_pct"] = f["Average_Load"].pct_change().shift(1)
         f["yoy_pct"] = f["Average_Load"].pct_change(12).shift(1)
         base = f["Average_Load"].copy()
@@ -964,9 +973,18 @@ class EnhancedLoadForecaster:
             f = f.join(self.rjpp, how="left")
             f["RJPP"] = f["RJPP"].ffill().bfill()
             f["RJPP_lag1"] = f["RJPP"].shift(1)
+            f["RJPP_lag12"] = f["RJPP"].shift(12)
             f["rjpp_gap"] = f["RJPP_lag1"] - f["Average_Load"].shift(1)
             f["rjpp_yoy_pct"] = f["RJPP"].pct_change(12).shift(1)
             f["rjpp_mom_pct"] = f["RJPP"].pct_change().shift(1)
+            # Ratio and differential features help residual models stay tightly aligned
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = f["Average_Load"].shift(1) / f["RJPP_lag1"]
+            f["rjpp_ratio_lag1"] = ratio.replace([np.inf, -np.inf], np.nan)
+            f["rjpp_ratio_lag12"] = (
+                f["Average_Load"].shift(12) / f["RJPP_lag12"]
+            ).replace([np.inf, -np.inf], np.nan)
+            f["rjpp_delta12"] = f["Average_Load"].shift(12) - f["RJPP_lag12"]
         return f
 
     # ---------- Naive baseline ----------
@@ -1056,21 +1074,31 @@ class EnhancedLoadForecaster:
         # Optimized feature selection for residual models with additional engineered features
         residual_feature_whitelist = [
             # Lag features (core temporal patterns)
-            "lag1", "lag12", "lag2", "lag3",  # Added lag2, lag3 for short-term patterns
+            "lag1", "lag2", "lag3", "lag6", "lag12",
             # Rolling statistics (trend and volatility)
-            "roll3_mean", "roll6_mean", "roll12_mean",  # Added roll6_mean for medium-term trends
-            "roll3_std", "roll12_std",  # Rolling standard deviations for volatility
+            "roll3_mean", "roll6_mean", "roll12_mean",
+            "roll3_std", "roll6_std", "roll12_std",
             # Growth rates (momentum indicators)
             "mom_pct", "yoy_pct",
             # Seasonal features (cyclical patterns)
             "month_sin", "month_cos", "quarter",
             # RJPP-related features (reference alignment)
-            "rjpp_mom_pct", "rjpp_yoy_pct", "rjpp_gap"
+            "rjpp_mom_pct", "rjpp_yoy_pct", "rjpp_gap",
+            "RJPP_lag1", "RJPP_lag12",
+            "rjpp_ratio_lag1", "rjpp_ratio_lag12", "rjpp_delta12"
         ]
         train_weights = w_series.loc[X_unscaled.index].astype(float).values if len(X_unscaled) else None
 
         # Ridge/ElasticNet with optimized feature selection and hyperparameters
-        ridge_features = [c for c in ["lag1", "lag12", "roll3_mean", "roll12_mean", "month_sin", "month_cos", "rjpp_mom_pct", "rjpp_yoy_pct", "rjpp_gap"] if c in X_unscaled.columns]
+        ridge_features = [
+            c for c in [
+                "lag1", "lag2", "lag3", "lag12",
+                "roll3_mean", "roll6_mean", "roll12_mean",
+                "rjpp_gap", "rjpp_mom_pct", "rjpp_yoy_pct",
+                "RJPP_lag1", "rjpp_ratio_lag1"
+            ]
+            if c in X_unscaled.columns
+        ]
         ridge_model = None
         ridge_status = "unavailable"
         ridge_impl = "Unavailable"
