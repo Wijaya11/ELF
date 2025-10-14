@@ -1,4 +1,4 @@
-﻿# app.py
+# app.py
 """S
 Enhanced Load Forecasting - Pro UI (Strict & Auditable)
 
