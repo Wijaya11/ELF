@@ -241,15 +241,18 @@ def show_metric(container, label, value, delta=None, key=None, explain_on: bool 
 
 
 def build_column_config(df: pd.DataFrame):
-    """Return a Streamlit column_config mapping using GLOSSARY where available."""
+    """Return a Streamlit ``column_config`` mapping with glossary tooltips when supported."""
     try:
-        config = {}
+        config: Dict[str, Any] = {}
+        column_config_mod = getattr(st, "column_config", None)
+        column_ctor = getattr(column_config_mod, "Column", None) if column_config_mod is not None else None
         for col in df.columns:
             key = _find_glossary_key(col)
             desc = GLOSSARY.get(key) if key else None
-            if desc:
-                config[col] = st.column_config.Column(col, help=desc) if hasattr(st, 'column_config') else st.column_config
-                # Note: st.column_config.Column may not exist on older Streamlit; fallback below handled by Streamlit
+            if not desc:
+                continue
+            if callable(column_ctor):
+                config[col] = column_ctor(col, help=desc)
         return config
     except Exception:
         return {}
@@ -642,21 +645,104 @@ def _read_csv_cached(path: str, sig: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _basic_data_checks(df: pd.DataFrame) -> Dict[str, int]:
-    """Compute core data-quality counts for Average_Load series."""
-    if df is None or df.empty or "Average_Load" not in df.columns:
-        return {"negatives": 0, "missing": 0, "dupe_dates": 0, "near_zero": 0}
-    series = df["Average_Load"].astype(float)
-    negatives = int((series < 0).sum())
-    missing = int(series.isna().sum())
-    dupe_dates = int(df.index.duplicated().sum())
-    near_zero = int((series.abs() < 1e-6).sum())
-    return {
-        "negatives": negatives,
-        "missing": missing,
-        "dupe_dates": dupe_dates,
-        "near_zero": near_zero,
+def _summarize_missing_months(index: pd.DatetimeIndex) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]:
+    """Return missing month strings, gap segments and the longest gap summary."""
+    if index.empty:
+        return [], [], {}
+    idx = index.sort_values().unique()
+    full = pd.date_range(idx.min(), idx.max(), freq="MS")
+    missing_idx = full.difference(idx)
+    if missing_idx.empty:
+        return [], [], {}
+
+    missing_str = [ts.strftime("%Y-%m-%d") for ts in missing_idx]
+    segments: List[Dict[str, Any]] = []
+    start = prev = missing_idx[0]
+    length = 1
+    for ts in missing_idx[1:]:
+        if ts == prev + pd.offsets.MonthBegin(1):
+            length += 1
+            prev = ts
+            continue
+        segments.append({
+            "start": start.strftime("%Y-%m-%d"),
+            "end": prev.strftime("%Y-%m-%d"),
+            "length": int(length),
+        })
+        start = prev = ts
+        length = 1
+    segments.append({
+        "start": start.strftime("%Y-%m-%d"),
+        "end": prev.strftime("%Y-%m-%d"),
+        "length": int(length),
+    })
+    longest = max(segments, key=lambda seg: seg["length"])
+    return missing_str, segments, longest
+
+
+def _basic_data_checks(df: pd.DataFrame) -> Dict[str, Any]:
+    """Compute core data-quality diagnostics for the ``Average_Load`` series."""
+    base_summary: Dict[str, Any] = {
+        "negatives": 0,
+        "missing": 0,
+        "dupe_dates": 0,
+        "near_zero": 0,
+        "missing_months": [],
+        "missing_month_count": 0,
+        "gap_segments": [],
+        "max_gap_segment": {},
+        "gap_segment_count": 0,
+        "outlier_count": 0,
+        "outlier_points": [],
+        "index_monotonic": True,
+        "inferred_frequency": None,
+        "duplicate_timestamps": 0,
+        "first_observation": None,
+        "last_observation": None,
     }
+
+    if df is None or df.empty or "Average_Load" not in df.columns:
+        return base_summary
+
+    series = df["Average_Load"].astype(float)
+    idx = pd.DatetimeIndex(df.index)
+    try:
+        inferred_freq = pd.infer_freq(idx.sort_values().unique()) if len(idx) > 3 else None
+    except (ValueError, TypeError):
+        inferred_freq = None
+
+    base_summary.update({
+        "negatives": int((series < 0).sum()),
+        "missing": int(series.isna().sum()),
+        "dupe_dates": int(idx.duplicated().sum()),
+        "duplicate_timestamps": int(idx.duplicated().sum()),
+        "near_zero": int((series.abs() < 1e-6).sum()),
+        "index_monotonic": bool(idx.is_monotonic_increasing),
+        "inferred_frequency": inferred_freq,
+        "first_observation": idx.min().strftime("%Y-%m-%d") if len(idx) else None,
+        "last_observation": idx.max().strftime("%Y-%m-%d") if len(idx) else None,
+    })
+
+    missing_months, segments, longest = _summarize_missing_months(idx)
+    base_summary["missing_months"] = missing_months
+    base_summary["missing_month_count"] = len(missing_months)
+    base_summary["gap_segments"] = segments[:50]
+    base_summary["gap_segment_count"] = len(segments)
+    base_summary["max_gap_segment"] = longest or {}
+
+    if len(series.dropna()) >= 6:
+        rolling_med = series.rolling(12, min_periods=6).median()
+        rolling_std = series.rolling(12, min_periods=6).std()
+        z_scores = (series - rolling_med) / rolling_std
+        outliers = z_scores[np.abs(z_scores) > 3].dropna()
+        if not outliers.empty:
+            base_summary["outlier_count"] = int(len(outliers))
+            base_summary["outlier_points"] = [
+                {"Date": ts.strftime("%Y-%m-%d"), "z_score": float(val)}
+                for ts, val in outliers.items()
+            ]
+
+    return base_summary
 
 @contextmanager
 def temp_params(obj, **kwargs):
@@ -4299,26 +4385,64 @@ with tab_quality:
     if dq_summary.get("near_zero", 0):
         st.info(f"{dq_summary['near_zero']} entries are near zero (<1e-6 MW); double-check units.")
     src = forecaster.load_df["Average_Load"]
-    full = pd.date_range(src.index.min(), src.index.max(), freq="MS")
-    missing = sorted(list(set(full) - set(src.index)))
-    dups = int(src.index.duplicated().sum())
-    z = (src - src.rolling(12, min_periods=6).median())/src.rolling(12, min_periods=6).std()
-    outliers = int((z.abs()>3).sum())
-    a,b,c = st.columns(3)
-    show_metric(a, "Missing Months", len(missing), explain_on=st.session_state.get("explain_mode", False))
-    show_metric(b, "Duplicate Timestamps", dups, explain_on=st.session_state.get("explain_mode", False))
-    show_metric(c, "Potential Outliers (|z|>3)", outliers, explain_on=st.session_state.get("explain_mode", False))
-    if len(missing):
-        missing_df = pd.DataFrame({"Date": pd.to_datetime(missing)})
+    missing_months_raw = dq_summary.get("missing_months", [])
+    missing_months_idx = pd.to_datetime(missing_months_raw) if missing_months_raw else pd.DatetimeIndex([])
+    missing_month_count = dq_summary.get("missing_month_count", len(missing_months_idx))
+    duplicate_ts = dq_summary.get("duplicate_timestamps", dq_summary.get("dupe_dates", 0))
+    outlier_points = dq_summary.get("outlier_points", []) or []
+    outlier_count = dq_summary.get("outlier_count", len(outlier_points))
+
+    a, b, c = st.columns(3)
+    show_metric(a, "Missing Months", missing_month_count, explain_on=explain_flag)
+    show_metric(b, "Duplicate Timestamps", duplicate_ts, explain_on=explain_flag)
+    show_metric(c, "Potential Outliers (|z|>3)", outlier_count, explain_on=explain_flag)
+
+    if missing_month_count:
+        st.warning(
+            f"Detected {missing_month_count} missing calendar month(s) within the historical window; "
+            "consider repairing gaps upstream."
+        )
+    if missing_months_idx.size:
+        missing_df = pd.DataFrame({"Date": missing_months_idx}).sort_values("Date")
         st.write("Missing months:")
         st.dataframe(missing_df.style.format({"Date": "{:%Y-%m}"}), use_container_width=True)
         st.download_button("Download missing months", missing_df.to_csv(index=False), "missing_months.csv", "text/csv")
-    outlier_points = z.loc[z.abs()>3].dropna()
-    if not outlier_points.empty:
-        out_df = outlier_points.to_frame(name="z_score")
+    longest_gap = dq_summary.get("max_gap_segment", {}) or {}
+    gap_len = int(longest_gap.get("length", 0) or 0)
+    if gap_len > 1:
+        gap_start = pd.to_datetime(longest_gap.get("start"))
+        gap_end = pd.to_datetime(longest_gap.get("end"))
+        if pd.notna(gap_start) and pd.notna(gap_end):
+            st.info(f"Longest missing stretch spans {gap_len} months ({gap_start:%Y-%m} – {gap_end:%Y-%m}).")
+    gap_segment_count = dq_summary.get("gap_segment_count", 0)
+    if gap_segment_count > 1:
+        st.caption(f"Detected {gap_segment_count} distinct gap segments between first and last observation.")
+
+    if outlier_points:
+        out_df = pd.DataFrame(outlier_points)
+        out_df["Date"] = pd.to_datetime(out_df["Date"])
+        out_df = out_df.sort_values("Date")
         st.write("Potential outliers (|z|>3):")
-        st.dataframe(out_df.style.format({"z_score": "{:.2f}"}), use_container_width=True)
-        st.download_button("Download outliers", out_df.to_csv(), "outliers.csv", "text/csv")
+        st.dataframe(out_df.style.format({"Date": "{:%Y-%m}", "z_score": "{:.2f}"}), use_container_width=True)
+        st.download_button(
+            "Download outliers",
+            out_df.to_csv(index=False),
+            "outliers.csv",
+            "text/csv",
+        )
+
+    freq = dq_summary.get("inferred_frequency")
+    if freq and freq != "MS":
+        st.warning(f"Inferred calendar frequency is '{freq}'; data was coerced to monthly start for modeling.")
+    if not dq_summary.get("index_monotonic", True):
+        st.warning("Historical index was not strictly increasing; records were sorted before training.")
+    first_obs = dq_summary.get("first_observation")
+    last_obs = dq_summary.get("last_observation")
+    if first_obs and last_obs:
+        st.caption(
+            f"Historical coverage: {pd.to_datetime(first_obs):%Y-%m} – {pd.to_datetime(last_obs):%Y-%m} "
+            f"({len(src)} monthly records)."
+        )
 
     if has_rjpp:
         fc_end = fc.index.max() if len(fc.index) else None
