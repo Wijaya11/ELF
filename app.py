@@ -3386,9 +3386,31 @@ fc_adj = None
 forecast_start_ts = pd.to_datetime(_month_start(forecast_start)).to_period("M").to_timestamp()
 
 if len(fc.index):
-    assert (fc.index < forecast_start_ts).sum() == 0, (
-        f"Forecast index contains values before {forecast_start_ts:%Y-%m}."
-    )
+    early_mask = fc.index < forecast_start_ts
+    if early_mask.any():
+        dropped_idx = fc.index[early_mask]
+        dropped_count = int(early_mask.sum())
+        preview = ", ".join(pd.Index(dropped_idx[:3]).strftime("%Y-%m"))
+        if dropped_count > 3:
+            preview += ", …"
+        logger.warning(
+            "Dropping %d forecast period(s) that precede the requested start %s: %s",
+            dropped_count,
+            forecast_start_ts.strftime("%Y-%m"),
+            preview,
+        )
+        st.warning(
+            f"Removed {dropped_count} forecast period(s) occurring before {forecast_start_ts:%Y-%m}."
+        )
+        fc = fc.loc[~early_mask].copy()
+        results["forecast"] = fc
+        st.session_state.results["forecast"] = fc
+        if fc_raw is not None:
+            fc_raw = fc_raw.loc[fc_raw.index >= forecast_start_ts].copy()
+            fc_raw = fc_raw.reindex(fc.index).copy()
+            results["forecast_raw"] = fc_raw
+            st.session_state.fc_raw = fc_raw
+            st.session_state.results["forecast_raw"] = fc_raw
 if st.session_state.apply_scenarios and scenario_records and len(fc.index):
     scenario_objects = []
     for entry in scenario_records:
