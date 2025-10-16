@@ -1,4 +1,4 @@
-﻿# app.py
+# app.py
 """S
 Enhanced Load Forecasting - Pro UI (Strict & Auditable)
 
@@ -107,7 +107,7 @@ GLOSSARY = {
   "MAE": "Mean Absolute Error; average absolute difference.",
   "sMAPE": "Symmetric MAPE (%); scale-free; treats over/under symmetrically.",
   "WAPE": "Weighted APE; more stable when actuals near zero.",
-  "Band calibration (p10–p90)": "Share of actuals inside p10–p90 band (expect ~80%). 100% may mean bands too wide.",
+  "Band calibration (p10-90)": "Share of actuals inside p10-90 band (expect ~80%). 100% may mean bands too wide.",
   "Clamped months": "Months where forecasts hit bounds/guards to avoid unrealistic jumps.",
   "CAGR": "Compound annual growth rate over the selected horizon.",
   "RJPP compliance": "Share of months within permissible RJPP deviation threshold.",
@@ -266,12 +266,10 @@ def build_column_config(df: pd.DataFrame):
 # ---------- Constants ----------
 # Historical data is no longer truncated by a fixed cutoff; consume full file.
 HISTORY_CUTOFF = None
-DEFAULT_FORECAST_START = pd.Timestamp("2025-09-01")
-DEFAULT_FORECAST_END   = pd.Timestamp("2041-12-01")
 
-NAIVE_TRAIN_CUTOFF = pd.Timestamp("2023-12-31")
-NAIVE_HOLDOUT_START = pd.Timestamp("2024-01-01")
-NAIVE_HOLDOUT_END   = pd.Timestamp("2025-08-01")
+# Holdout / validation sizing
+MAX_HOLDOUT_MONTHS = 24
+MIN_HOLDOUT_MONTHS = 6
 
 DEFAULT_VAL_MONTHS = 12
 DEFAULT_ROLLING_K  = 2
@@ -308,7 +306,7 @@ PRESETS = {
     },
 
     # Prediction bands (empirical)
-    "band_target_coverage": 0.80,     # target P10–P90 ≈ 80%
+    "band_target_coverage": 0.80,     # target P10-90 ~= 80%
     "band_k_bounds": (0.6, 1.8, 0.05),  # (min, max, step) for band_k search
     "clamp_bands_to_rjpp": False,     # do NOT clamp bands to RJPP by default
 
@@ -612,9 +610,11 @@ def _derive_forecast_bounds(load_file, rjpp_file) -> Dict[str, Any]:
     load_last = _uploaded_last_month(load_file)
     rjpp_last = _uploaded_last_month(rjpp_file)
 
-    start_default = DEFAULT_FORECAST_START
     if load_last is not None and pd.notna(load_last):
         start_default = (load_last + pd.offsets.MonthBegin(1)).to_timestamp("MS")
+    else:
+        today = pd.Timestamp.today().to_period("M").to_timestamp("MS")
+        start_default = today
 
     start_min = start_default
 
@@ -627,9 +627,7 @@ def _derive_forecast_bounds(load_file, rjpp_file) -> Dict[str, Any]:
     if pd.isna(end_max) or end_max < start_default:
         end_max = start_default
 
-    end_default = min(DEFAULT_FORECAST_END, end_max)
-    if end_default < start_default:
-        end_default = start_default
+    end_default = end_max
 
     def _to_date(ts: pd.Timestamp) -> date:
         if isinstance(ts, pd.Timestamp):
@@ -899,7 +897,7 @@ def _training_signature(load_path: str, rjpp_path: Optional[str], init_params: D
 @st.cache_resource(show_spinner=False)
 def _train_forecaster_cached(load_path: str, rjpp_path: Optional[str], init_params: Dict[str, Any], runtime_params: Dict[str, Any], signature: str) -> bytes:
     """Cache trained forecaster keyed by data signature to avoid repeat training."""
-    logger.info(f"Cache miss – training forecaster for signature {signature}")
+    logger.info(f"Cache miss - training forecaster for signature {signature}")
     forecaster = EnhancedLoadForecaster(**init_params)
     forecaster.load(load_path, rjpp_path)
     for attr, value in runtime_params.items():
@@ -1262,7 +1260,11 @@ class EnhancedLoadForecaster:
         f["mom_pct"] = f["Average_Load"].pct_change().shift(1)
         f["yoy_pct"] = f["Average_Load"].pct_change(12).shift(1)
         base = f["Average_Load"].copy()
-        base.loc[base.index > NAIVE_TRAIN_CUTOFF] = np.nan
+        cutoff = getattr(self, "history_last_date", None)
+        if isinstance(cutoff, pd.Timestamp):
+            cutoff = (cutoff - pd.DateOffset(months=12)).to_period("M").to_timestamp("MS")
+        if cutoff is not None:
+            base.loc[base.index > cutoff] = np.nan
         f["naive"] = base.shift(12)
         if self.rjpp is not None:
             f = f.join(self.rjpp, how="left")
@@ -1295,9 +1297,22 @@ class EnhancedLoadForecaster:
         return pd.Series(vals, index=idx, name="Naive")
 
     def naive_holdout(self):
-        idx = pd.date_range(NAIVE_HOLDOUT_START, NAIVE_HOLDOUT_END, freq="MS")
+        hist = self.load_df["Average_Load"].dropna()
+        if hist.empty:
+            idx = pd.DatetimeIndex([])
+            naive = pd.Series(dtype=float, name="Naive")
+            return naive, {}
+
+        end = hist.index.max().to_period("M").to_timestamp("MS")
+        available_months = len(hist)
+        holdout_months = max(MIN_HOLDOUT_MONTHS, min(MAX_HOLDOUT_MONTHS, available_months // 3 if available_months >= 9 else available_months))
+        holdout_months = int(max(1, min(holdout_months, available_months)))
+        start = (end - pd.DateOffset(months=holdout_months - 1)).to_period("M").to_timestamp("MS")
+        start = max(start, hist.index.min())
+
+        idx = pd.date_range(start, end, freq="MS")
         y = self.load_df["Average_Load"].reindex(idx)
-        naive = self._naive_forecast_series(NAIVE_HOLDOUT_START, NAIVE_HOLDOUT_END)
+        naive = self._naive_forecast_series(start, end)
         mask = y.notna() & naive.notna()
         if mask.any():
             return naive, {
@@ -1953,13 +1968,19 @@ class EnhancedLoadForecaster:
                             )
                             self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
                         else:
-                            # Fallback to Ridge with very light regularization
-                            self.meta_model = Ridge(alpha=1e-3, positive=True, random_state=DEFAULT_RANDOM_STATE)
+                            # Fallback to a simple positive-constrained linear blend when CV is unavailable
+                            try:
+                                self.meta_model = LinearRegression(positive=True)
+                            except TypeError:
+                                self.meta_model = LinearRegression()
                             self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
                         self.meta_models_order = common
                     except Exception as meta_err:
-                        logger.warning(f"Meta-model training with ElasticNetCV failed: {meta_err}; using LinearRegression fallback")
-                        self.meta_model = LinearRegression(positive=True)
+                        logger.warning(f"Meta-ensemble training failed: {meta_err}; reverting to simple linear blend")
+                        try:
+                            self.meta_model = LinearRegression(positive=True)
+                        except TypeError:
+                            self.meta_model = LinearRegression()
                         self.meta_model.fit(df_meta.loc[mask, common].values, yv.loc[mask].values)
                         self.meta_models_order = common
 
@@ -2666,8 +2687,15 @@ class EnhancedLoadForecaster:
             return pd.DataFrame(index=idx)
 
         rjpp_future = None
-        if self.rjpp is not None:
-            rjpp_future = self.rjpp.reindex(pd.date_range(self.rjpp.index.min(), end, freq="MS")).ffill().reindex(idx)["RJPP"]
+        self._rjpp_uncovered_months = pd.DatetimeIndex([])
+        if self.rjpp is not None and len(self.rjpp):
+            rjpp_start = self.rjpp.index.min()
+            rjpp_end = self.rjpp.index.max()
+            slice_end = min(end, rjpp_end)
+            base_idx = pd.date_range(rjpp_start, slice_end, freq="MS")
+            rjpp_future = self.rjpp.reindex(base_idx).ffill().reindex(idx)["RJPP"]
+            if end > rjpp_end:
+                self._rjpp_uncovered_months = idx[idx > rjpp_end]
 
         preds_raw: Dict[str, np.ndarray] = {}
         naive_series = self._naive_forecast_series(start, end)
@@ -2971,17 +2999,18 @@ class EnhancedLoadForecaster:
         result = ensemble.copy()
         for year in sorted(set(ensemble.index.year)):
             mask = ensemble.index.year == year
-            if not mask.any():
+            valid_mask = mask & rjpp.notna()
+            if not valid_mask.any():
                 continue
-            e_mean = float(ensemble.loc[mask].mean())
-            r_mean = float(rjpp.loc[mask].mean())
+            e_mean = float(ensemble.loc[valid_mask].mean())
+            r_mean = float(rjpp.loc[valid_mask].mean())
             if not (np.isfinite(e_mean) and np.isfinite(r_mean) and r_mean > 0 and e_mean > 0):
                 continue
             k = r_mean / e_mean
             # Apply scaler but preserve monthly fluctuations better by using softer bounds
             k_soft = 0.7 * k + 0.3 * 1.0  # Blend toward no scaling for fluctuation preservation
             k_soft = float(np.clip(k_soft, 1 - tolerance, 1 + tolerance))
-            result.loc[mask] = result.loc[mask] * k_soft
+            result.loc[valid_mask] = result.loc[valid_mask] * k_soft
             logger.info(f"Annual scaler for {year}: k={k:.4f}, applied={k_soft:.4f}")
         return result
 
@@ -2996,9 +3025,14 @@ class EnhancedLoadForecaster:
         aligned = rjpp.reindex(idx)
         if aligned is None or aligned.empty:
             return ensemble
-        lower = aligned * (1 - dev.values)
-        upper = aligned * (1 + dev.values)
-        return ensemble.clip(lower=lower, upper=upper)
+        result = ensemble.copy()
+        valid = aligned.notna()
+        if not valid.any():
+            return result
+        lower = aligned[valid] * (1 - dev.loc[valid])
+        upper = aligned[valid] * (1 + dev.loc[valid])
+        result.loc[valid] = result.loc[valid].clip(lower=lower, upper=upper)
+        return result
 
     def _apply_horizon_caps(self, ensemble: pd.Series, rjpp: pd.Series, start_date: pd.Timestamp) -> pd.Series:
         """Apply horizon-aware deviation caps vs RJPP (soft guard, not magnet)."""
@@ -3297,6 +3331,8 @@ class EnhancedLoadForecaster:
 
         naive_curve, naive_metrics = self.naive_holdout()
 
+        rjpp_uncovered = getattr(self, "_rjpp_uncovered_months", pd.DatetimeIndex([]))
+
         full_idx = pd.date_range(self.load_df.index.min(), fc.index.max(), freq="MS")
         combined = pd.Series(np.nan, index=full_idx, name="Combined")
         combined.loc[self.load_df.index] = self.load_df["Average_Load"]
@@ -3305,6 +3341,9 @@ class EnhancedLoadForecaster:
         rjpp_full = None
         if self.rjpp is not None:
             rjpp_full = self.rjpp.reindex(full_idx).ffill()
+            last_rjpp = self.rjpp.index.max()
+            if pd.notna(last_rjpp):
+                rjpp_full = rjpp_full.where(full_idx <= last_rjpp)
 
         best_model=None
         if self.validation_results:
@@ -3371,612 +3410,620 @@ class EnhancedLoadForecaster:
             "calibration_pct": calib_pct,
             "validation_windows": self.validation_windows,
             "rjpp_proximity": rjpp_proximity,
+            "rjpp_uncovered_months": rjpp_uncovered,
         }
 
 # ---------- Streamlit App ----------
-if not RUNNING_AS_MAIN:
-    raise SystemExit(0)
 
-st.set_page_config(page_title="Load Forecasting", page_icon="LF", layout="wide")
+def main():
+    st.set_page_config(page_title="Load Forecasting", page_icon="LF", layout="wide")
 
-# ----- Initialize Session State First (Before Any Usage) -----
-if "results" not in st.session_state: 
-    st.session_state.results = None
-if "forecaster" not in st.session_state: 
-    st.session_state.forecaster = None
-if "fc_raw" not in st.session_state: 
-    st.session_state.fc_raw = None
-if "combined" not in st.session_state: 
-    st.session_state.combined = None
-if "rjpp_full" not in st.session_state: 
-    st.session_state.rjpp_full = None
-if "filesig" not in st.session_state: 
-    st.session_state.filesig = (None, None)
-if "training_params" not in st.session_state:
-    st.session_state.training_params = {
-        "val_months": DEFAULT_VAL_MONTHS,
-        "rolling_k": DEFAULT_ROLLING_K,
-        "mom_limit_quantile": 0.90,
-        "max_dev": DEFAULT_MAX_DEV,
-        "add_noise": PRESETS["add_noise"],
-        "noise_scale": PRESETS["noise_scale"],
-    }
-if "model_flags" not in st.session_state:
-    st.session_state.model_flags = {
-        "use_prophet": PROPHET_AVAILABLE,
-        "use_xgb": XGB_AVAILABLE,
-        "use_lgb": LGB_AVAILABLE,
-    }
-if "training_params_dirty" not in st.session_state:
-    st.session_state.training_params_dirty = False
-if "ai_focus_banner" not in st.session_state:
-    st.session_state.ai_focus_banner = False
-if "last_training_sig" not in st.session_state:
-    st.session_state.last_training_sig = None
+    # ----- Initialize Session State First (Before Any Usage) -----
+    if "results" not in st.session_state: 
+        st.session_state.results = None
+    if "forecaster" not in st.session_state: 
+        st.session_state.forecaster = None
+    if "fc_raw" not in st.session_state: 
+        st.session_state.fc_raw = None
+    if "combined" not in st.session_state: 
+        st.session_state.combined = None
+    if "rjpp_full" not in st.session_state: 
+        st.session_state.rjpp_full = None
+    if "filesig" not in st.session_state: 
+        st.session_state.filesig = (None, None)
+    if "training_params" not in st.session_state:
+        st.session_state.training_params = {
+            "val_months": DEFAULT_VAL_MONTHS,
+            "rolling_k": DEFAULT_ROLLING_K,
+            "mom_limit_quantile": 0.90,
+            "max_dev": DEFAULT_MAX_DEV,
+            "add_noise": PRESETS["add_noise"],
+            "noise_scale": PRESETS["noise_scale"],
+        }
+    if "model_flags" not in st.session_state:
+        st.session_state.model_flags = {
+            "use_prophet": PROPHET_AVAILABLE,
+            "use_xgb": XGB_AVAILABLE,
+            "use_lgb": LGB_AVAILABLE,
+        }
+    if "training_params_dirty" not in st.session_state:
+        st.session_state.training_params_dirty = False
+    if "ai_focus_banner" not in st.session_state:
+        st.session_state.ai_focus_banner = False
+    if "last_training_sig" not in st.session_state:
+        st.session_state.last_training_sig = None
 
-# Scenario-related state
-if "scenarios" not in st.session_state: 
-    st.session_state.scenarios = []
-if "scenario_files" not in st.session_state: 
-    st.session_state.scenario_files = {}
-if "apply_scenarios" not in st.session_state: 
-    st.session_state.apply_scenarios = False
-if "fc_adjusted" not in st.session_state: 
-    st.session_state.fc_adjusted = None
-if "combined_adjusted" not in st.session_state: 
-    st.session_state.combined_adjusted = None
-if "planned_overlay" not in st.session_state: 
-    st.session_state.planned_overlay = None
+    # Scenario-related state
+    if "scenarios" not in st.session_state: 
+        st.session_state.scenarios = []
+    if "scenario_files" not in st.session_state: 
+        st.session_state.scenario_files = {}
+    if "apply_scenarios" not in st.session_state: 
+        st.session_state.apply_scenarios = False
+    if "fc_adjusted" not in st.session_state: 
+        st.session_state.fc_adjusted = None
+    if "combined_adjusted" not in st.session_state: 
+        st.session_state.combined_adjusted = None
+    if "planned_overlay" not in st.session_state: 
+        st.session_state.planned_overlay = None
 
-# AI-related state
-if "ai_markdown" not in st.session_state: 
-    st.session_state.ai_markdown = None
-if "ai_error" not in st.session_state: 
-    st.session_state.ai_error = None
-if "ai_running" not in st.session_state: 
-    st.session_state.ai_running = False
-if "ai_cancel" not in st.session_state:
-    st.session_state.ai_cancel = False
+    # AI-related state
+    if "ai_markdown" not in st.session_state: 
+        st.session_state.ai_markdown = None
+    if "ai_error" not in st.session_state: 
+        st.session_state.ai_error = None
+    if "ai_running" not in st.session_state: 
+        st.session_state.ai_running = False
+    if "ai_cancel" not in st.session_state:
+        st.session_state.ai_cancel = False
 
-# Form and editor state
-if "scenario_editor_selected" not in st.session_state: 
-    st.session_state.scenario_editor_selected = "<New>"
-if "scenario_form_state" not in st.session_state: 
-    st.session_state.scenario_form_state = SCENARIO_FORM_DEFAULT.copy()
-if "pending_filesig" not in st.session_state: 
-    st.session_state.pending_filesig = (None, None)
+    # Form and editor state
+    if "scenario_editor_selected" not in st.session_state: 
+        st.session_state.scenario_editor_selected = "<New>"
+    if "scenario_form_state" not in st.session_state: 
+        st.session_state.scenario_form_state = SCENARIO_FORM_DEFAULT.copy()
+    if "pending_filesig" not in st.session_state: 
+        st.session_state.pending_filesig = (None, None)
 
-st.title("Load Forecasting")
-st.caption("RJPP-anchored ensemble with uncertainty bands and model diagnostics.")
+    st.title("Load Forecasting")
+    st.caption("RJPP-anchored ensemble with uncertainty bands and model diagnostics.")
 
-# Top-level controls
-col1, col2 = st.columns([3, 1])
-with col1:
-    # Explain mode toggle (inline help everywhere)
-    explain_on = st.toggle("🧠 Explain mode", value=False, key="explain_mode")
-with col2:
-    # Emergency reset button for session state pollution
-    if st.button("🔄 Reset All", help="Clear all cached data and start fresh", type="secondary"):
-        # Preserve only essential keys
-        essential_keys = ["explain_mode"]
-        preserved = {k: st.session_state[k] for k in essential_keys if k in st.session_state}
-        # Clear everything
-        for key in list(st.session_state.keys()):
-            if key not in essential_keys:
-                del st.session_state[key]
-        # Restore preserved
-        for k, v in preserved.items():
-            st.session_state[k] = v
-        st.success("Session reset complete!")
-        st.rerun()
+    # Top-level controls
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        # Explain mode toggle (inline help everywhere)
+        explain_on = st.toggle("🧠 Explain mode", value=False, key="explain_mode")
+    with col2:
+        # Emergency reset button for session state pollution
+        if st.button("🔄 Reset All", help="Clear all cached data and start fresh", type="secondary"):
+            # Preserve only essential keys
+            essential_keys = ["explain_mode"]
+            preserved = {k: st.session_state[k] for k in essential_keys if k in st.session_state}
+            # Clear everything
+            for key in list(st.session_state.keys()):
+                if key not in essential_keys:
+                    del st.session_state[key]
+            # Restore preserved
+            for k, v in preserved.items():
+                st.session_state[k] = v
+            st.success("Session reset complete!")
+            st.rerun()
 
-# CSS polish
-st.markdown("""
-<style>
-[data-testid="stMetric"] { background: rgba(255,255,255,0.03); border-radius: 12px; padding: 10px 12px; }
-.block-container { padding-top: 1.2rem; }
-</style>
-""", unsafe_allow_html=True)
+    # CSS polish
+    st.markdown("""
+    <style>
+    [data-testid="stMetric"] { background: rgba(255,255,255,0.03); border-radius: 12px; padding: 10px 12px; }
+    .block-container { padding-top: 1.2rem; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# ----- Sidebar inputs & quick actions -----
-with st.sidebar:
-    st.header("Inputs")
-    load_file = st.file_uploader(
-        "Historical Load Data (CSV)",
-        type=["csv"],
-        help="Must contain 'Date' and 'Average_Load' (monthly).",
-    )
-    rjpp_file = st.file_uploader(
-        "RJPP Data (CSV)",
-        type=["csv"],
-        help="Optional 'Date' + 'RJPP'.",
-    )
-
-    bounds = _derive_forecast_bounds(load_file, rjpp_file)
-    st.session_state["forecast_bounds"] = bounds
-
-    forecast_start = st.date_input(
-        "Forecast start",
-        value=bounds["start_value"],
-        min_value=bounds["start_min"],
-        max_value=bounds["end_max"],
-    )
-    forecast_end = st.date_input(
-        "Forecast end",
-        value=bounds["end_value"],
-        min_value=bounds["start_value"],
-        max_value=bounds["end_max"],
-    )
-
-    st.markdown("---")
-    st.header("Quick actions")
-    run_btn = st.button(
-        "🔮 Run forecast",
-        type="primary",
-        use_container_width=True,
-        help="Compute forecasts using uploaded data and current settings.",
-    )
-    run_ai_quick = st.button(
-        "🧠 Run AI insight",
-        use_container_width=True,
-        help="Jump to the AI Insight tab and prepare a summary.",
-    )
-    prev_noise = bool(st.session_state.training_params.get("add_noise", PRESETS["add_noise"]))
-    add_noise_toggle = st.toggle(
-        "Add residual noise",
-        value=prev_noise,
-    )
-    if bool(add_noise_toggle) != prev_noise:
-        st.session_state.training_params_dirty = True
-    st.session_state.training_params["add_noise"] = bool(add_noise_toggle)
-    st.caption("Noise adds realism to bands & scenarios")
-
-if 'run_ai_quick' in locals() and run_ai_quick:
-    st.session_state.ai_focus_banner = True
-
-# Derive flags from PRESETS (no UI controls)
-use_rjpp = True  # Always use RJPP if available
-residualize_flag = True  # Always residualize models
-apply_guards_to = "ensemble"  # Only apply guards to ensemble, not individual models
-guard_mom_cap = None  # Will be computed dynamically per-horizon from PRESETS
-guard_smoothing_window = 1  # No unconditional smoothing (smoothing_alpha=0.0)
-display_mode = "Both"  # Default to showing both history and forecast
-
-# Scenario apply toggle now lives exclusively in the Scenarios tab header (single source of truth per redesign spec).
-
-# ----- Helper functions for file handling and plotting -----
-
-def _file_sig(uploaded):
-    return hashlib.md5(uploaded.getvalue()).hexdigest() if uploaded is not None else None
-
-def shaded(fig, start_x, end_x): fig.add_vrect(x0=start_x, x1=end_x, fillcolor="rgba(200,200,200,0.15)", line_width=0)
-
-def plot_hero(combined, fc, rjpp_full, key_suffix="", show_bands: bool = True, bounded: bool = False, max_dev: Optional[float] = None, fc_adj: Optional[pd.DataFrame] = None, combined_adj: Optional[pd.Series] = None, planned_overlay: Optional[pd.Series] = None, label_base: str = "Base", label_adj: str = "Scenario-Adjusted", forecast_start: Optional[pd.Timestamp] = None):
-    fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-    shade_start = fc.index.min() if len(fc.index) else None
-
-    expected_start = None
-    if forecast_start is not None:
-        expected_start = pd.to_datetime(forecast_start).to_period("M").to_timestamp()
-    if expected_start is not None and shade_start is not None and shade_start != expected_start:
-        warning_msg = (
-            f"Forecast start misalignment detected at {shade_start:%Y-%m}; expected {expected_start:%Y-%m}"
+    # ----- Sidebar inputs & quick actions -----
+    with st.sidebar:
+        st.header("Inputs")
+        load_file = st.file_uploader(
+            "Historical Load Data (CSV)",
+            type=["csv"],
+            help="Must contain 'Date' and 'Average_Load' (monthly).",
         )
-        st.warning(warning_msg)
-        logger.warning(warning_msg)
-        logger.debug(
-            "plot_hero start misalignment | shade_start=%s expected_start=%s fc_start=%s fc_end=%s len=%s",
-            shade_start,
-            expected_start,
-            fc.index.min() if len(fc.index) else None,
-            fc.index.max() if len(fc.index) else None,
-            len(fc.index),
+        rjpp_file = st.file_uploader(
+            "RJPP Data (CSV)",
+            type=["csv"],
+            help="Optional 'Date' + 'RJPP'.",
         )
-        if expected_start in fc.index:
-            shade_start = expected_start
-        else:
-            logger.debug(
-                "expected_start %s not found in forecast index; proceeding with available start %s",
-                expected_start,
-                shade_start,
+
+        bounds = _derive_forecast_bounds(load_file, rjpp_file)
+        st.session_state["forecast_bounds"] = bounds
+
+        forecast_start = st.date_input(
+            "Forecast start",
+            value=bounds["start_value"],
+            min_value=bounds["start_min"],
+            max_value=bounds["end_max"],
+        )
+        forecast_end = st.date_input(
+            "Forecast end",
+            value=bounds["end_value"],
+            min_value=bounds["start_value"],
+            max_value=bounds["end_max"],
+        )
+
+        st.markdown("---")
+        st.header("Quick actions")
+        run_btn = st.button(
+            "🔮 Run forecast",
+            type="primary",
+            use_container_width=True,
+            help="Compute forecasts using uploaded data and current settings.",
+        )
+        run_ai_quick = st.button(
+            "🧠 Run AI insight",
+            use_container_width=True,
+            help="Jump to the AI Insight tab and prepare a summary.",
+        )
+        prev_noise = bool(st.session_state.training_params.get("add_noise", PRESETS["add_noise"]))
+        add_noise_toggle = st.toggle(
+            "Add residual noise",
+            value=prev_noise,
+        )
+        if bool(add_noise_toggle) != prev_noise:
+            st.session_state.training_params_dirty = True
+        st.session_state.training_params["add_noise"] = bool(add_noise_toggle)
+        st.caption("Noise adds realism to bands & scenarios")
+
+    if 'run_ai_quick' in locals() and run_ai_quick:
+        st.session_state.ai_focus_banner = True
+
+    # Derive flags from PRESETS (no UI controls)
+    use_rjpp = True  # Always use RJPP if available
+    residualize_flag = True  # Always residualize models
+    apply_guards_to = "ensemble"  # Only apply guards to ensemble, not individual models
+    guard_mom_cap = None  # Will be computed dynamically per-horizon from PRESETS
+    guard_smoothing_window = 1  # No unconditional smoothing (smoothing_alpha=0.0)
+    display_mode = "Both"  # Default to showing both history and forecast
+
+    # Scenario apply toggle now lives exclusively in the Scenarios tab header (single source of truth per redesign spec).
+
+    # ----- Helper functions for file handling and plotting -----
+
+    def _file_sig(uploaded):
+        return hashlib.md5(uploaded.getvalue()).hexdigest() if uploaded is not None else None
+
+    def shaded(fig, start_x, end_x): fig.add_vrect(x0=start_x, x1=end_x, fillcolor="rgba(200,200,200,0.15)", line_width=0)
+
+    def plot_hero(combined, fc, rjpp_full, key_suffix="", show_bands: bool = True, bounded: bool = False, max_dev: Optional[float] = None, fc_adj: Optional[pd.DataFrame] = None, combined_adj: Optional[pd.Series] = None, planned_overlay: Optional[pd.Series] = None, label_base: str = "Base", label_adj: str = "Scenario-Adjusted", forecast_start: Optional[pd.Timestamp] = None):
+        fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+        shade_start = fc.index.min() if len(fc.index) else None
+
+        expected_start = None
+        if forecast_start is not None:
+            expected_start = pd.to_datetime(forecast_start).to_period("M").to_timestamp()
+        if expected_start is not None and shade_start is not None and shade_start != expected_start:
+            warning_msg = (
+                f"Forecast start misalignment detected at {shade_start:%Y-%m}; expected {expected_start:%Y-%m}"
             )
-
-    if shade_start is not None:
-        shaded(fig, shade_start, fc.index.max())
-
-    base_col = "p50" if "p50" in fc.columns else ("Ensemble" if "Ensemble" in fc.columns else None)
-    base_series = fc[base_col].astype(float) if base_col is not None else pd.Series(dtype=float)
-
-    adjusted_series = None
-    if fc_adj is not None:
-        if "p50_adj" in fc_adj.columns:
-            adjusted_series = fc_adj["p50_adj"].astype(float)
-        elif "Ensemble_adj" in fc_adj.columns:
-            adjusted_series = fc_adj["Ensemble_adj"].astype(float)
-
-    if isinstance(combined, pd.DataFrame):
-        combined_series = combined.iloc[:, 0].astype(float)
-        combined_series.name = combined.columns[0]
-    else:
-        combined_series = pd.Series(combined, dtype=float)
-
-    forecast_index = fc.index if len(fc.index) else combined_series.index
-    stitched_base = pd.Series(
-        np.nan,
-        index=combined_series.index.union(forecast_index),
-        dtype=float,
-        name=base_series.name if hasattr(base_series, "name") else None,
-    )
-    if base_col and len(base_series):
-        stitched_base.loc[forecast_index] = base_series.reindex(forecast_index).values
-
-    stitched_adj = None
-    if adjusted_series is not None:
-        adj_index = adjusted_series.index
-        if combined_adj is not None:
-            if isinstance(combined_adj, pd.DataFrame):
-                combined_adj_series = combined_adj.iloc[:, 0].astype(float)
+            st.warning(warning_msg)
+            logger.warning(warning_msg)
+            logger.debug(
+                "plot_hero start misalignment | shade_start=%s expected_start=%s fc_start=%s fc_end=%s len=%s",
+                shade_start,
+                expected_start,
+                fc.index.min() if len(fc.index) else None,
+                fc.index.max() if len(fc.index) else None,
+                len(fc.index),
+            )
+            if expected_start in fc.index:
+                shade_start = expected_start
             else:
-                combined_adj_series = pd.Series(combined_adj, dtype=float)
-            stitched_adj_index = combined_adj_series.index.union(adj_index)
+                logger.debug(
+                    "expected_start %s not found in forecast index; proceeding with available start %s",
+                    expected_start,
+                    shade_start,
+                )
+
+        if shade_start is not None:
+            shaded(fig, shade_start, fc.index.max())
+
+        base_col = "p50" if "p50" in fc.columns else ("Ensemble" if "Ensemble" in fc.columns else None)
+        base_series = fc[base_col].astype(float) if base_col is not None else pd.Series(dtype=float)
+
+        adjusted_series = None
+        if fc_adj is not None:
+            if "p50_adj" in fc_adj.columns:
+                adjusted_series = fc_adj["p50_adj"].astype(float)
+            elif "Ensemble_adj" in fc_adj.columns:
+                adjusted_series = fc_adj["Ensemble_adj"].astype(float)
+
+        if isinstance(combined, pd.DataFrame):
+            combined_series = combined.iloc[:, 0].astype(float)
+            combined_series.name = combined.columns[0]
         else:
-            stitched_adj_index = combined_series.index.union(adj_index)
-        stitched_adj = pd.Series(np.nan, index=stitched_adj_index, dtype=float)
-        stitched_adj.loc[adj_index] = adjusted_series.reindex(adj_index).values
+            combined_series = pd.Series(combined, dtype=float)
 
-    if fc_adj is not None and {"p10_adj", "p90_adj"}.issubset(fc_adj.columns):
-        col_map = {}
-        if "p10_adj" in fc_adj.columns:
-            col_map["p10"] = fc_adj["p10_adj"]
-        if "p90_adj" in fc_adj.columns:
-            col_map["p90"] = fc_adj["p90_adj"]
-        if "p50_adj" in fc_adj.columns:
-            col_map["p50"] = fc_adj["p50_adj"]
-        bands_df = pd.DataFrame(col_map, index=fc_adj.index)
-        band_label = label_adj
-        band_color = PALETTE.get("scenario", PALETTE["ensemble"])
+        forecast_index = fc.index if len(fc.index) else combined_series.index
+        stitched_base = pd.Series(
+            np.nan,
+            index=combined_series.index.union(forecast_index),
+            dtype=float,
+            name=base_series.name if hasattr(base_series, "name") else None,
+        )
+        if base_col and len(base_series):
+            stitched_base.loc[forecast_index] = base_series.reindex(forecast_index).values
+
+        stitched_adj = None
+        if adjusted_series is not None:
+            adj_index = adjusted_series.index
+            if combined_adj is not None:
+                if isinstance(combined_adj, pd.DataFrame):
+                    combined_adj_series = combined_adj.iloc[:, 0].astype(float)
+                else:
+                    combined_adj_series = pd.Series(combined_adj, dtype=float)
+                stitched_adj_index = combined_adj_series.index.union(adj_index)
+            else:
+                stitched_adj_index = combined_series.index.union(adj_index)
+            stitched_adj = pd.Series(np.nan, index=stitched_adj_index, dtype=float)
+            stitched_adj.loc[adj_index] = adjusted_series.reindex(adj_index).values
+
+        if fc_adj is not None and {"p10_adj", "p90_adj"}.issubset(fc_adj.columns):
+            col_map = {}
+            if "p10_adj" in fc_adj.columns:
+                col_map["p10"] = fc_adj["p10_adj"]
+            if "p90_adj" in fc_adj.columns:
+                col_map["p90"] = fc_adj["p90_adj"]
+            if "p50_adj" in fc_adj.columns:
+                col_map["p50"] = fc_adj["p50_adj"]
+            bands_df = pd.DataFrame(col_map, index=fc_adj.index)
+            band_label = label_adj
+            band_color = PALETTE.get("scenario", PALETTE["ensemble"])
+        else:
+            bands_df = fc.copy()
+            if "p50" not in bands_df.columns and "Ensemble" in bands_df.columns:
+                bands_df["p50"] = bands_df["Ensemble"]
+            band_label = label_base
+            band_color = PALETTE["ensemble"]
+
+        if bounded and show_bands and max_dev is not None and {"p10", "p90"}.issubset(bands_df.columns):
+            rjpp_series = None
+            if rjpp_full is not None and isinstance(rjpp_full, pd.DataFrame) and "RJPP" in rjpp_full.columns:
+                rjpp_series = rjpp_full["RJPP"].reindex(fc.index)
+            elif "RJPP" in fc.columns:
+                rjpp_series = fc["RJPP"]
+            if rjpp_series is not None:
+                clamp_lo = rjpp_series * (1 - BAND_MULT * max_dev)
+                clamp_hi = rjpp_series * (1 + BAND_MULT * max_dev)
+                bands_df = bands_df.copy()
+                bands_df["p10"] = np.maximum(bands_df["p10"], clamp_lo)
+                bands_df["p90"] = np.minimum(bands_df["p90"], clamp_hi)
+
+        if show_bands and {"p10", "p90"}.issubset(bands_df.columns):
+            fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p90"], name=f"{band_label} p90", mode="lines", line=dict(width=1, dash="dot")))
+            fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p10"], name=f"{band_label} p10", mode="lines", line=dict(width=1, dash="dot")))
+            fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p90"], name=f"{band_label} band upper", mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p10"], name=f"{band_label} band lower", mode="lines", fill="tonexty", opacity=0.12 if fc_adj is not None else 0.18, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+            if "p50" in bands_df.columns:
+                fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p50"], name=f"{band_label} p50", mode="lines", line=dict(width=2, dash="dot", color=band_color), showlegend=False))
+
+        history_series = combined_series.copy()
+        if shade_start is not None:
+            history_series.loc[shade_start:] = np.nan
+        fig.add_trace(go.Scatter(x=history_series.index, y=history_series.values, name="Actual (history)", mode="lines", line=dict(width=1.6, color=PALETTE["history"])))
+
+        if len(stitched_base):
+            base_name = f"{label_base} ({base_col})" if base_col else label_base
+            fig.add_trace(go.Scatter(x=stitched_base.index, y=stitched_base.values, name=base_name, mode="lines", line=dict(width=3, color=PALETTE["ensemble"])))
+
+        if stitched_adj is not None:
+            fig.add_trace(go.Scatter(x=stitched_adj.index, y=stitched_adj.values, name=label_adj, mode="lines", line=dict(width=3, color=PALETTE.get("scenario", PALETTE["ensemble"]), dash="dash")))
+
+        if planned_overlay is not None:
+            overlay_series = planned_overlay.reindex(fc.index).fillna(0)
+            if overlay_series.any():
+                fig.add_trace(go.Scatter(x=overlay_series.index, y=overlay_series.values, name="Planned MW", mode="lines", fill="tozeroy", opacity=0.2, line=dict(width=1.4, color=PALETTE.get("planned", "#6366F1"))))
+
+        if rjpp_full is not None:
+            fig.add_trace(go.Scatter(x=rjpp_full.index, y=rjpp_full["RJPP"], name="RJPP", mode="lines", line=dict(dash="dot", color=PALETTE["rjpp"])))
+
+        if shade_start is not None:
+            fig.add_vline(x=shade_start, line_width=1, line_dash="dot", line_color="orange")
+
+        fig.update_yaxes(range=[0, None], ticksuffix=" MW")
+        fig.update_layout(height=560, yaxis_title="Load (MW)")
+        st.plotly_chart(fig, use_container_width=True, key=f"hero_{key_suffix}")
+
+    def plot_per_model(combined, fc, fc_raw, rjpp_full, slot_info):
+        figm = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+        shade_start = fc.index.min() if len(fc.index) else None
+        if shade_start is not None:
+            shaded(figm, shade_start, fc.index.max())
+        full_idx = pd.date_range(combined.index.min(), combined.index.max(), freq="MS")
+        actual_only = pd.Series(np.nan, index=full_idx, name="Actual (history)")
+        actual_only.loc[:HISTORY_CUTOFF] = combined.loc[:HISTORY_CUTOFF]
+        figm.add_trace(go.Scatter(x=actual_only.index, y=actual_only.values, name="Actual (history)", mode="lines",
+                                  line=dict(width=1.2, color="rgba(120,120,120,0.8)")))
+        for m in MODEL_SLOTS:
+            if m in fc_raw.columns:
+                s = pd.Series(np.nan, index=full_idx, dtype=float)
+                s.loc[fc_raw.index.min():] = fc_raw[m].values
+                impl = slot_info.get(m, {}).get("impl")
+                label = impl if impl else ("SARIMA(X)" if m=="SARIMAX" else ("Regression (Ridge)" if m=="Ridge" else m))
+                figm.add_trace(go.Scatter(x=s.index, y=s.values, name=label, mode="lines", line=dict(width=1.6)))
+        stitched = pd.concat([actual_only.loc[:HISTORY_CUTOFF], fc["Ensemble"]]).reindex(full_idx)
+        figm.add_trace(go.Scatter(x=stitched.index, y=stitched.values, name="Ensemble", mode="lines", line=dict(width=3, color=PALETTE["ensemble"])))
+        if rjpp_full is not None:
+            figm.add_trace(go.Scatter(x=rjpp_full.index, y=rjpp_full["RJPP"], name="RJPP", line=dict(dash="dot", color=PALETTE["rjpp"])))
+        if shade_start is not None:
+            figm.add_vline(x=shade_start, line_width=1, line_dash="dot", line_color="orange")
+        figm.update_yaxes(range=[0, None], ticksuffix=" MW", title_text="Load (MW)")
+        figm.update_layout(height=560)
+        st.plotly_chart(figm, use_container_width=True, key="per_model_stitched")
+
+
+    def plot_reliability(val_actual: pd.Series, p10: pd.Series, p90: pd.Series):
+        aligned_idx = val_actual.index.intersection(p10.index).intersection(p90.index)
+        if aligned_idx.empty:
+            st.info("No overlapping validation data available for reliability diagram.")
+            return
+        actual = val_actual.reindex(aligned_idx).astype(float)
+        lower = p10.reindex(aligned_idx).astype(float)
+        upper = p90.reindex(aligned_idx).astype(float)
+        mask = actual.notna() & lower.notna() & upper.notna()
+        if not mask.any():
+            st.info("Validation data lacks complete bands for reliability diagram.")
+            return
+        inside = ((actual >= lower) & (actual <= upper))[mask].astype(int)
+        quarter_map = {0: "Q1", 1: "Q2", 2: "Q3", 3: "Q4"}
+        quarter_series = ((inside.index.month - 1) // 3).map(quarter_map)
+        grouped = inside.groupby(quarter_series).mean().reindex(["Q1", "Q2", "Q3", "Q4"]).fillna(0.0)
+        fig = go.Figure(
+            go.Bar(x=grouped.index.astype(str), y=(grouped * 100.0), marker_color=PALETTE.get("ensemble", "#F5BF2C"))
+        )
+        fig.update_layout(
+            PLOTLY_BASE_LAYOUT | {
+                "yaxis_title": "Inside band (%)",
+                "xaxis_title": "Validation quarter",
+                "yaxis": {"range": [0, 100]},
+            }
+        )
+        st.plotly_chart(fig, use_container_width=True, key="band_reliability")
+
+    def corr_heatmap(df: pd.DataFrame, cols: List[str]):
+        x = df[cols].copy().replace([np.inf, -np.inf], np.nan).dropna()
+        if len(x) < 2: return None
+        c = x.corr()
+        fig = px.imshow(c, text_auto=".2f", aspect="auto", color_continuous_scale="Blues")
+        fig.update_layout(PLOTLY_BASE_LAYOUT)
+        st.plotly_chart(fig, use_container_width=True, key="corr_heatmap")
+
+    def scenario_apply(forecaster, fc_raw, max_dev_pct: float, ensemble_mode: str, add_noise_flag: bool):
+        mode = None if ensemble_mode == "Auto" else ("weighted" if ensemble_mode=="Weighted" else "meta")
+        with temp_params(forecaster, max_dev=max_dev_pct, ensemble_override=mode, add_noise=add_noise_flag):
+            base = fc_raw.drop(columns=["RJPP"]) if (not getattr(forecaster, "use_rjpp", True) and "RJPP" in fc_raw.columns) else fc_raw
+            rjpp_future = None
+            if getattr(forecaster, "rjpp", None) is not None: 
+                rjpp_future = forecaster.rjpp.reindex(base.index).ffill()["RJPP"]
+            fc_alt = forecaster._align_noise_clip(base, fc_raw, rjpp_future)
+            fc_alt = fc_alt.join(forecaster._quantile_bands(fc_alt, fc_raw))
+        return fc_alt
+
+    # ----- Session state bootstrap (already initialized above) -----
+
+    # ----- Run/Refresh pipeline when needed -----
+    if load_file is not None:
+        load_sig = _file_sig(load_file)
+        rjpp_sig = _file_sig(rjpp_file) if rjpp_file is not None else None
+        st.session_state.pending_filesig = (load_sig, rjpp_sig)
     else:
-        bands_df = fc.copy()
-        if "p50" not in bands_df.columns and "Ensemble" in bands_df.columns:
-            bands_df["p50"] = bands_df["Ensemble"]
-        band_label = label_base
-        band_color = PALETTE["ensemble"]
+        st.session_state.pending_filesig = (None, None)
 
-    if bounded and show_bands and max_dev is not None and {"p10", "p90"}.issubset(bands_df.columns):
-        rjpp_series = None
-        if rjpp_full is not None and isinstance(rjpp_full, pd.DataFrame) and "RJPP" in rjpp_full.columns:
-            rjpp_series = rjpp_full["RJPP"].reindex(fc.index)
-        elif "RJPP" in fc.columns:
-            rjpp_series = fc["RJPP"]
-        if rjpp_series is not None:
-            clamp_lo = rjpp_series * (1 - BAND_MULT * max_dev)
-            clamp_hi = rjpp_series * (1 + BAND_MULT * max_dev)
-            bands_df = bands_df.copy()
-            bands_df["p10"] = np.maximum(bands_df["p10"], clamp_lo)
-            bands_df["p90"] = np.minimum(bands_df["p90"], clamp_hi)
+    if run_btn and load_file is None:
+        st.warning("Upload CSVs before running the forecast.")
 
-    if show_bands and {"p10", "p90"}.issubset(bands_df.columns):
-        fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p90"], name=f"{band_label} p90", mode="lines", line=dict(width=1, dash="dot")))
-        fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p10"], name=f"{band_label} p10", mode="lines", line=dict(width=1, dash="dot")))
-        fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p90"], name=f"{band_label} band upper", mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p10"], name=f"{band_label} band lower", mode="lines", fill="tonexty", opacity=0.12 if fc_adj is not None else 0.18, line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        if "p50" in bands_df.columns:
-            fig.add_trace(go.Scatter(x=bands_df.index, y=bands_df["p50"], name=f"{band_label} p50", mode="lines", line=dict(width=2, dash="dot", color=band_color), showlegend=False))
-
-    history_series = combined_series.copy()
-    if shade_start is not None:
-        history_series.loc[shade_start:] = np.nan
-    fig.add_trace(go.Scatter(x=history_series.index, y=history_series.values, name="Actual (history)", mode="lines", line=dict(width=1.6, color=PALETTE["history"])))
-
-    if len(stitched_base):
-        base_name = f"{label_base} ({base_col})" if base_col else label_base
-        fig.add_trace(go.Scatter(x=stitched_base.index, y=stitched_base.values, name=base_name, mode="lines", line=dict(width=3, color=PALETTE["ensemble"])))
-
-    if stitched_adj is not None:
-        fig.add_trace(go.Scatter(x=stitched_adj.index, y=stitched_adj.values, name=label_adj, mode="lines", line=dict(width=3, color=PALETTE.get("scenario", PALETTE["ensemble"]), dash="dash")))
-
-    if planned_overlay is not None:
-        overlay_series = planned_overlay.reindex(fc.index).fillna(0)
-        if overlay_series.any():
-            fig.add_trace(go.Scatter(x=overlay_series.index, y=overlay_series.values, name="Planned MW", mode="lines", fill="tozeroy", opacity=0.2, line=dict(width=1.4, color=PALETTE.get("planned", "#6366F1"))))
-
-    if rjpp_full is not None:
-        fig.add_trace(go.Scatter(x=rjpp_full.index, y=rjpp_full["RJPP"], name="RJPP", mode="lines", line=dict(dash="dot", color=PALETTE["rjpp"])))
-
-    if shade_start is not None:
-        fig.add_vline(x=shade_start, line_width=1, line_dash="dot", line_color="orange")
-
-    fig.update_yaxes(range=[0, None], ticksuffix=" MW")
-    fig.update_layout(height=560, yaxis_title="Load (MW)")
-    st.plotly_chart(fig, use_container_width=True, key=f"hero_{key_suffix}")
-
-def plot_per_model(combined, fc, fc_raw, rjpp_full, slot_info):
-    figm = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-    shade_start = fc.index.min() if len(fc.index) else None
-    if shade_start is not None:
-        shaded(figm, shade_start, fc.index.max())
-    full_idx = pd.date_range(combined.index.min(), combined.index.max(), freq="MS")
-    actual_only = pd.Series(np.nan, index=full_idx, name="Actual (history)")
-    actual_only.loc[:HISTORY_CUTOFF] = combined.loc[:HISTORY_CUTOFF]
-    figm.add_trace(go.Scatter(x=actual_only.index, y=actual_only.values, name="Actual (history)", mode="lines",
-                              line=dict(width=1.2, color="rgba(120,120,120,0.8)")))
-    for m in MODEL_SLOTS:
-        if m in fc_raw.columns:
-            s = pd.Series(np.nan, index=full_idx, dtype=float)
-            s.loc[fc_raw.index.min():] = fc_raw[m].values
-            impl = slot_info.get(m, {}).get("impl")
-            label = impl if impl else ("SARIMA(X)" if m=="SARIMAX" else ("Regression (Ridge)" if m=="Ridge" else m))
-            figm.add_trace(go.Scatter(x=s.index, y=s.values, name=label, mode="lines", line=dict(width=1.6)))
-    stitched = pd.concat([actual_only.loc[:HISTORY_CUTOFF], fc["Ensemble"]]).reindex(full_idx)
-    figm.add_trace(go.Scatter(x=stitched.index, y=stitched.values, name="Ensemble", mode="lines", line=dict(width=3, color=PALETTE["ensemble"])))
-    if rjpp_full is not None:
-        figm.add_trace(go.Scatter(x=rjpp_full.index, y=rjpp_full["RJPP"], name="RJPP", line=dict(dash="dot", color=PALETTE["rjpp"])))
-    if shade_start is not None:
-        figm.add_vline(x=shade_start, line_width=1, line_dash="dot", line_color="orange")
-    figm.update_yaxes(range=[0, None], ticksuffix=" MW", title_text="Load (MW)")
-    figm.update_layout(height=560)
-    st.plotly_chart(figm, use_container_width=True, key="per_model_stitched")
-
-
-def plot_reliability(val_actual: pd.Series, p10: pd.Series, p90: pd.Series):
-    aligned_idx = val_actual.index.intersection(p10.index).intersection(p90.index)
-    if aligned_idx.empty:
-        st.info("No overlapping validation data available for reliability diagram.")
-        return
-    actual = val_actual.reindex(aligned_idx).astype(float)
-    lower = p10.reindex(aligned_idx).astype(float)
-    upper = p90.reindex(aligned_idx).astype(float)
-    mask = actual.notna() & lower.notna() & upper.notna()
-    if not mask.any():
-        st.info("Validation data lacks complete bands for reliability diagram.")
-        return
-    inside = ((actual >= lower) & (actual <= upper))[mask].astype(int)
-    quarter_map = {0: "Q1", 1: "Q2", 2: "Q3", 3: "Q4"}
-    quarter_series = ((inside.index.month - 1) // 3).map(quarter_map)
-    grouped = inside.groupby(quarter_series).mean().reindex(["Q1", "Q2", "Q3", "Q4"]).fillna(0.0)
-    fig = go.Figure(
-        go.Bar(x=grouped.index.astype(str), y=(grouped * 100.0), marker_color=PALETTE.get("ensemble", "#F5BF2C"))
-    )
-    fig.update_layout(
-        PLOTLY_BASE_LAYOUT | {
-            "yaxis_title": "Inside band (%)",
-            "xaxis_title": "Validation quarter",
-            "yaxis": {"range": [0, 100]},
-        }
-    )
-    st.plotly_chart(fig, use_container_width=True, key="band_reliability")
-
-def corr_heatmap(df: pd.DataFrame, cols: List[str]):
-    x = df[cols].copy().replace([np.inf, -np.inf], np.nan).dropna()
-    if len(x) < 2: return None
-    c = x.corr()
-    fig = px.imshow(c, text_auto=".2f", aspect="auto", color_continuous_scale="Blues")
-    fig.update_layout(PLOTLY_BASE_LAYOUT)
-    st.plotly_chart(fig, use_container_width=True, key="corr_heatmap")
-
-def scenario_apply(forecaster, fc_raw, max_dev_pct: float, ensemble_mode: str, add_noise_flag: bool):
-    mode = None if ensemble_mode == "Auto" else ("weighted" if ensemble_mode=="Weighted" else "meta")
-    with temp_params(forecaster, max_dev=max_dev_pct, ensemble_override=mode, add_noise=add_noise_flag):
-        base = fc_raw.drop(columns=["RJPP"]) if (not getattr(forecaster, "use_rjpp", True) and "RJPP" in fc_raw.columns) else fc_raw
-        rjpp_future = None
-        if getattr(forecaster, "rjpp", None) is not None: 
-            rjpp_future = forecaster.rjpp.reindex(base.index).ffill()["RJPP"]
-        fc_alt = forecaster._align_noise_clip(base, fc_raw, rjpp_future)
-        fc_alt = fc_alt.join(forecaster._quantile_bands(fc_alt, fc_raw))
-    return fc_alt
-
-# ----- Session state bootstrap (already initialized above) -----
-
-# ----- Run/Refresh pipeline when needed -----
-if load_file is not None:
-    load_sig = _file_sig(load_file)
-    rjpp_sig = _file_sig(rjpp_file) if rjpp_file is not None else None
-    st.session_state.pending_filesig = (load_sig, rjpp_sig)
-else:
-    st.session_state.pending_filesig = (None, None)
-
-if run_btn and load_file is None:
-    st.warning("Upload CSVs before running the forecast.")
-
-if load_file is not None and run_btn:
-    try:
-        start_dt, end_dt = _month_start(forecast_start), _month_start(forecast_end)
-        start_dt = pd.Timestamp(start_dt)
-        end_dt = pd.Timestamp(end_dt)
-        bounds_runtime = st.session_state.get("forecast_bounds", {})
-        start_floor = bounds_runtime.get("start_ts")
-        end_cap = bounds_runtime.get("end_max_ts")
-        window_adjustments: List[str] = []
-        if isinstance(start_floor, pd.Timestamp) and start_dt < start_floor:
-            start_dt = pd.Timestamp(start_floor)
-            window_adjustments.append(f"start -> {start_dt.strftime('%Y-%m')}")
-        if isinstance(end_cap, pd.Timestamp) and end_dt > end_cap:
-            end_dt = pd.Timestamp(end_cap)
-            window_adjustments.append(f"end -> {end_dt.strftime('%Y-%m')}")
-        if end_dt < start_dt:
-            end_dt = start_dt
-        start_dt = start_dt.to_period("M").to_timestamp("MS")
-        end_dt = end_dt.to_period("M").to_timestamp("MS")
-
-        load_path = _save_file(load_file, "load_")
-        rjpp_path = _save_file(rjpp_file, "rjpp_") if rjpp_file else None
-        
-        if load_path is None:
-            st.error("Failed to save load file. Please try uploading again.")
-            st.stop()
-        
-        training_params = st.session_state.training_params.copy()
-        model_flags = st.session_state.model_flags.copy()
-
-        # ensure plain python types for hashing
-        training_params["val_months"] = int(training_params.get("val_months", DEFAULT_VAL_MONTHS))
-        training_params["rolling_k"] = int(training_params.get("rolling_k", DEFAULT_ROLLING_K))
-        training_params["mom_limit_quantile"] = float(training_params.get("mom_limit_quantile", 0.90))
-        training_params["max_dev"] = float(training_params.get("max_dev", DEFAULT_MAX_DEV))
-        training_params["add_noise"] = bool(training_params.get("add_noise", PRESETS["add_noise"]))
-        training_params["noise_scale"] = float(training_params.get("noise_scale", PRESETS["noise_scale"]))
-
-        init_params = {
-            "max_dev": training_params["max_dev"],
-            "add_noise": training_params["add_noise"],
-            "ensemble_override": None,
-            "random_state": DEFAULT_RANDOM_STATE,
-            "use_rjpp": use_rjpp,
-            "residualize": residualize_flag,
-            "apply_guards_to": apply_guards_to,
-            "stabilize_output": False,
-            "guard_mom_cap": guard_mom_cap,
-            "guard_smoothing_window": guard_smoothing_window,
-            "noise_scale": training_params["noise_scale"],
-            "use_prophet": bool(model_flags.get("use_prophet", PROPHET_AVAILABLE)),
-            "use_xgb": bool(model_flags.get("use_xgb", XGB_AVAILABLE)),
-            "use_lgb": bool(model_flags.get("use_lgb", LGB_AVAILABLE)),
-        }
-
-        runtime_params = {
-            "val_months": training_params["val_months"],
-            "rolling_k": training_params["rolling_k"],
-            "mom_limit_quantile": training_params["mom_limit_quantile"],
-            "max_dev": training_params["max_dev"],
-            "add_noise": training_params["add_noise"],
-            "noise_scale": training_params["noise_scale"],
-            "ensemble_override": None,
-            "guard_mom_cap": guard_mom_cap,
-            "guard_smoothing_window": guard_smoothing_window,
-            "use_prophet": init_params["use_prophet"],
-            "use_xgb": init_params["use_xgb"],
-            "use_lgb": init_params["use_lgb"],
-            "use_rjpp": use_rjpp,
-            "residualize": residualize_flag,
-            "apply_guards_to": apply_guards_to,
-            "stabilize_output": False,
-        }
-
-        cache_sig = _training_signature(load_path, rjpp_path, init_params, runtime_params)
-        files_changed = st.session_state.pending_filesig != st.session_state.filesig
-        if files_changed:
-            logger.info("Detected new input data; recomputing forecast.")
-        
-        cache_hit = (st.session_state.last_training_sig == cache_sig) and not files_changed
-        status_label = "Reusing cached models…" if cache_hit else "Training models…"
-        with st.status(status_label, expanded=True) as status:
-            status.write("Loading & validating data")
-            forecaster_blob = _train_forecaster_cached(load_path, rjpp_path, init_params, runtime_params, cache_sig)
-            status.write("Assembling ensembles & calibration")
-            forecaster = pickle.loads(forecaster_blob)
-            for attr, value in runtime_params.items():
-                setattr(forecaster, attr, value)
-            hist_last = getattr(forecaster, "history_last_date", None)
-            if isinstance(hist_last, pd.Timestamp) and not pd.isna(hist_last):
-                earliest_start = (pd.Timestamp(hist_last) + pd.offsets.MonthBegin(1)).to_period("M").to_timestamp("MS")
-                if start_dt < earliest_start:
-                    start_dt = earliest_start
-                    window_adjustments.append(f"start -> {start_dt.strftime('%Y-%m')}")
-            rjpp_last = getattr(forecaster, "rjpp_last_date", None)
-            if isinstance(rjpp_last, pd.Timestamp) and not pd.isna(rjpp_last):
-                rjpp_last = pd.Timestamp(rjpp_last).to_period("M").to_timestamp("MS")
-                if end_dt > rjpp_last:
-                    end_dt = rjpp_last
-                    window_adjustments.append(f"end -> {end_dt.strftime('%Y-%m')}")
+    if load_file is not None and run_btn:
+        try:
+            start_dt, end_dt = _month_start(forecast_start), _month_start(forecast_end)
+            start_dt = pd.Timestamp(start_dt)
+            end_dt = pd.Timestamp(end_dt)
+            bounds_runtime = st.session_state.get("forecast_bounds", {})
+            start_floor = bounds_runtime.get("start_ts")
+            end_cap = bounds_runtime.get("end_max_ts")
+            window_adjustments: List[str] = []
+            if isinstance(start_floor, pd.Timestamp) and start_dt < start_floor:
+                start_dt = pd.Timestamp(start_floor)
+                window_adjustments.append(f"start -> {start_dt.strftime('%Y-%m')}")
+            if isinstance(end_cap, pd.Timestamp) and end_dt > end_cap:
+                end_dt = pd.Timestamp(end_cap)
+                window_adjustments.append(f"end -> {end_dt.strftime('%Y-%m')}")
             if end_dt < start_dt:
                 end_dt = start_dt
             start_dt = start_dt.to_period("M").to_timestamp("MS")
             end_dt = end_dt.to_period("M").to_timestamp("MS")
-            status.write("Generating forecast, bands, and diagnostics")
-            results = forecaster.run_post_training(start_dt, end_dt)
-            final_label = "Forecast ready (cached)" if cache_hit else "Training complete"
-            status.update(label=final_label, state="complete")
+
+            load_path = _save_file(load_file, "load_")
+            rjpp_path = _save_file(rjpp_file, "rjpp_") if rjpp_file else None
         
-        results["max_dev"] = forecaster.max_dev
-        st.session_state.results = results
-        st.session_state.forecaster = forecaster
-        st.session_state.fc_raw = results["forecast_raw"]
-        st.session_state.combined = results["combined_forecast"]["Combined"]
-        st.session_state.rjpp_full = results["rjpp_full"]
-        st.session_state.filesig = st.session_state.pending_filesig
-        st.session_state.last_training_sig = cache_sig
-        st.session_state.training_params_dirty = False
-        st.session_state.last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state.fc_adjusted = None
-        st.session_state.combined_adjusted = None
-        st.session_state.planned_overlay = None
-        st.session_state.ai_markdown = None
-        st.session_state.ai_error = None
-        st.session_state.last_run_start_ts = start_dt
-        st.session_state.last_run_end_ts = end_dt
-        st.success("Forecast completed successfully!")
-        if window_adjustments:
-            uniq_adjustments = list(dict.fromkeys(window_adjustments))
-            st.info("Adjusted forecast window to align with available data/RJPP: " + ", ".join(uniq_adjustments))
+            if load_path is None:
+                st.error("Failed to save load file. Please try uploading again.")
+                st.stop()
+        
+            training_params = st.session_state.training_params.copy()
+            model_flags = st.session_state.model_flags.copy()
 
-    except Exception as e:
-        st.error(f"Error during forecast computation: {str(e)}")
-        st.error("Please check your input data format and try again.")
-        if st.checkbox("Show detailed error information", value=False):
-            st.code(traceback.format_exc())
+            # ensure plain python types for hashing
+            training_params["val_months"] = int(training_params.get("val_months", DEFAULT_VAL_MONTHS))
+            training_params["rolling_k"] = int(training_params.get("rolling_k", DEFAULT_ROLLING_K))
+            training_params["mom_limit_quantile"] = float(training_params.get("mom_limit_quantile", 0.90))
+            training_params["max_dev"] = float(training_params.get("max_dev", DEFAULT_MAX_DEV))
+            training_params["add_noise"] = bool(training_params.get("add_noise", PRESETS["add_noise"]))
+            training_params["noise_scale"] = float(training_params.get("noise_scale", PRESETS["noise_scale"]))
 
-# ----- Require a run before showing tabs -----
-if st.session_state.results is None:
-    st.info("Upload CSVs and click **Run / Refresh** to compute forecasts.")
-    st.stop()
+            init_params = {
+                "max_dev": training_params["max_dev"],
+                "add_noise": training_params["add_noise"],
+                "ensemble_override": None,
+                "random_state": DEFAULT_RANDOM_STATE,
+                "use_rjpp": use_rjpp,
+                "residualize": residualize_flag,
+                "apply_guards_to": apply_guards_to,
+                "stabilize_output": False,
+                "guard_mom_cap": guard_mom_cap,
+                "guard_smoothing_window": guard_smoothing_window,
+                "noise_scale": training_params["noise_scale"],
+                "use_prophet": bool(model_flags.get("use_prophet", PROPHET_AVAILABLE)),
+                "use_xgb": bool(model_flags.get("use_xgb", XGB_AVAILABLE)),
+                "use_lgb": bool(model_flags.get("use_lgb", LGB_AVAILABLE)),
+            }
 
-# Unpack session artifacts
-results = st.session_state.results
-forecaster = st.session_state.forecaster
-fc = results["forecast"]
-fc_raw = st.session_state.fc_raw
-combined = st.session_state.combined
-rjpp_full = st.session_state.rjpp_full
-planned_overlay = None
-scenario_records = st.session_state.scenarios
-results["scenarios"] = scenario_records
-fc_adj = None
+            runtime_params = {
+                "val_months": training_params["val_months"],
+                "rolling_k": training_params["rolling_k"],
+                "mom_limit_quantile": training_params["mom_limit_quantile"],
+                "max_dev": training_params["max_dev"],
+                "add_noise": training_params["add_noise"],
+                "noise_scale": training_params["noise_scale"],
+                "ensemble_override": None,
+                "guard_mom_cap": guard_mom_cap,
+                "guard_smoothing_window": guard_smoothing_window,
+                "use_prophet": init_params["use_prophet"],
+                "use_xgb": init_params["use_xgb"],
+                "use_lgb": init_params["use_lgb"],
+                "use_rjpp": use_rjpp,
+                "residualize": residualize_flag,
+                "apply_guards_to": apply_guards_to,
+                "stabilize_output": False,
+            }
 
-stored_start_ts = st.session_state.get("last_run_start_ts")
-if isinstance(stored_start_ts, pd.Timestamp):
-    forecast_start_ts = stored_start_ts
-else:
-    forecast_start_ts = pd.to_datetime(_month_start(forecast_start)).to_period("M").to_timestamp()
-
-if st.session_state.apply_scenarios and scenario_records and len(fc.index):
-    scenario_objects = []
-    for entry in scenario_records:
-        clean_entry = _scenario_clean_dict(entry)
-        try:
-            scenario_objects.append(Scenario(**clean_entry))
-        except Exception as exc:
-            logger.warning(f"Skipping scenario {entry.get('name')}: {exc}")
-    if scenario_objects:
-        idx = fc.index
-        custom_map = st.session_state.scenario_files
-        planned_overlay = sum_scenarios(scenario_objects, idx, custom_map=custom_map)
-        planned_overlay.name = "planned_overlay"
-        rjpp_series = fc["RJPP"] if "RJPP" in fc.columns else None
-        # Do not clamp scenario-adjusted forecast to RJPP. Scenarios represent
-        # additional firm load; physically they should add to demand even if
-        # they exceed RJPP envelopes. Compliance can be evaluated separately.
-        fc_adj = apply_scenarios_to_bands(
-            fc,
-            planned_overlay,
-            rjpp_series,
-            forecaster.max_dev,
-            clamp_to_rjpp=False,
-        )
-        base_adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else ("Ensemble_adj" if "Ensemble_adj" in fc_adj.columns else None)
-        combined_adj = st.session_state.combined.copy() if st.session_state.combined is not None else None
-        if combined_adj is not None and base_adj_col:
-            combined_adj = combined_adj.reindex(combined_adj.index.union(fc_adj.index))
-            combined_adj.loc[fc_adj.index] = fc_adj[base_adj_col].values
-            st.session_state.combined_adjusted = combined_adj
-        else:
+            cache_sig = _training_signature(load_path, rjpp_path, init_params, runtime_params)
+            files_changed = st.session_state.pending_filesig != st.session_state.filesig
+            if files_changed:
+                logger.info("Detected new input data; recomputing forecast.")
+        
+            cache_hit = (st.session_state.last_training_sig == cache_sig) and not files_changed
+            status_label = "Reusing cached models…" if cache_hit else "Training models…"
+            with st.status(status_label, expanded=True) as status:
+                status.write("Loading & validating data")
+                forecaster_blob = _train_forecaster_cached(load_path, rjpp_path, init_params, runtime_params, cache_sig)
+                status.write("Assembling ensembles & calibration")
+                forecaster = pickle.loads(forecaster_blob)
+                for attr, value in runtime_params.items():
+                    setattr(forecaster, attr, value)
+                hist_last = getattr(forecaster, "history_last_date", None)
+                if isinstance(hist_last, pd.Timestamp) and not pd.isna(hist_last):
+                    earliest_start = (pd.Timestamp(hist_last) + pd.offsets.MonthBegin(1)).to_period("M").to_timestamp("MS")
+                    if start_dt < earliest_start:
+                        start_dt = earliest_start
+                        window_adjustments.append(f"start -> {start_dt.strftime('%Y-%m')}")
+                rjpp_last = getattr(forecaster, "rjpp_last_date", None)
+                if isinstance(rjpp_last, pd.Timestamp) and not pd.isna(rjpp_last):
+                    rjpp_last = pd.Timestamp(rjpp_last).to_period("M").to_timestamp("MS")
+                    if end_dt > rjpp_last:
+                        end_dt = rjpp_last
+                        window_adjustments.append(f"end -> {end_dt.strftime('%Y-%m')}")
+                if end_dt < start_dt:
+                    end_dt = start_dt
+                start_dt = start_dt.to_period("M").to_timestamp("MS")
+                end_dt = end_dt.to_period("M").to_timestamp("MS")
+                status.write("Generating forecast, bands, and diagnostics")
+                results = forecaster.run_post_training(start_dt, end_dt)
+                final_label = "Forecast ready (cached)" if cache_hit else "Training complete"
+                status.update(label=final_label, state="complete")
+        
+            results["max_dev"] = forecaster.max_dev
+            st.session_state.results = results
+            st.session_state.forecaster = forecaster
+            st.session_state.fc_raw = results["forecast_raw"]
+            st.session_state.combined = results["combined_forecast"]["Combined"]
+            st.session_state.rjpp_full = results["rjpp_full"]
+            st.session_state.filesig = st.session_state.pending_filesig
+            st.session_state.last_training_sig = cache_sig
+            st.session_state.training_params_dirty = False
+            st.session_state.last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state.fc_adjusted = None
             st.session_state.combined_adjusted = None
-        st.session_state.fc_adjusted = fc_adj
-        st.session_state.planned_overlay = planned_overlay
-        results["forecast_adjusted"] = fc_adj
-        results["scenario_planned_overlay"] = planned_overlay
-        scenario_set = ScenarioSet(scenario_objects)
-        results["scenario_set"] = scenario_set
-        results["scenario_exogenous_stub"] = scenario_set_to_future_exogenous(scenario_set, idx)
+            st.session_state.planned_overlay = None
+            st.session_state.ai_markdown = None
+            st.session_state.ai_error = None
+            st.session_state.last_run_start_ts = start_dt
+            st.session_state.last_run_end_ts = end_dt
+            st.success("Forecast completed successfully!")
+            if window_adjustments:
+                uniq_adjustments = list(dict.fromkeys(window_adjustments))
+                st.info("Adjusted forecast window to align with available data/RJPP: " + ", ".join(uniq_adjustments))
+
+        except Exception as e:
+            st.error(f"Error during forecast computation: {str(e)}")
+            st.error("Please check your input data format and try again.")
+            if st.checkbox("Show detailed error information", value=False):
+                st.code(traceback.format_exc())
+
+    # ----- Require a run before showing tabs -----
+    if st.session_state.results is None:
+        st.info("Upload CSVs and click **Run / Refresh** to compute forecasts.")
+        st.stop()
+
+    # Unpack session artifacts
+    results = st.session_state.results
+    forecaster = st.session_state.forecaster
+    fc = results["forecast"]
+    fc_raw = st.session_state.fc_raw
+    combined = st.session_state.combined
+    rjpp_full = st.session_state.rjpp_full
+    planned_overlay = None
+    scenario_records = st.session_state.scenarios
+    results["scenarios"] = scenario_records
+    fc_adj = None
+
+    stored_start_ts = st.session_state.get("last_run_start_ts")
+    if isinstance(stored_start_ts, pd.Timestamp):
+        forecast_start_ts = stored_start_ts
+    else:
+        forecast_start_ts = pd.to_datetime(_month_start(forecast_start)).to_period("M").to_timestamp()
+
+    if st.session_state.apply_scenarios and scenario_records and len(fc.index):
+        scenario_objects = []
+        for entry in scenario_records:
+            clean_entry = _scenario_clean_dict(entry)
+            try:
+                scenario_objects.append(Scenario(**clean_entry))
+            except Exception as exc:
+                logger.warning(f"Skipping scenario {entry.get('name')}: {exc}")
+        if scenario_objects:
+            idx = fc.index
+            custom_map = st.session_state.scenario_files
+            planned_overlay = sum_scenarios(scenario_objects, idx, custom_map=custom_map)
+            planned_overlay.name = "planned_overlay"
+            rjpp_series = fc["RJPP"] if "RJPP" in fc.columns else None
+            # Do not clamp scenario-adjusted forecast to RJPP. Scenarios represent
+            # additional firm load; physically they should add to demand even if
+            # they exceed RJPP envelopes. Compliance can be evaluated separately.
+            fc_adj = apply_scenarios_to_bands(
+                fc,
+                planned_overlay,
+                rjpp_series,
+                forecaster.max_dev,
+                clamp_to_rjpp=False,
+            )
+            base_adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else ("Ensemble_adj" if "Ensemble_adj" in fc_adj.columns else None)
+            combined_adj = st.session_state.combined.copy() if st.session_state.combined is not None else None
+            if combined_adj is not None and base_adj_col:
+                combined_adj = combined_adj.reindex(combined_adj.index.union(fc_adj.index))
+                combined_adj.loc[fc_adj.index] = fc_adj[base_adj_col].values
+                st.session_state.combined_adjusted = combined_adj
+            else:
+                st.session_state.combined_adjusted = None
+            st.session_state.fc_adjusted = fc_adj
+            st.session_state.planned_overlay = planned_overlay
+            results["forecast_adjusted"] = fc_adj
+            results["scenario_planned_overlay"] = planned_overlay
+            scenario_set = ScenarioSet(scenario_objects)
+            results["scenario_set"] = scenario_set
+            results["scenario_exogenous_stub"] = scenario_set_to_future_exogenous(scenario_set, idx)
+        else:
+            st.session_state.fc_adjusted = None
+            st.session_state.planned_overlay = None
+            st.session_state.combined_adjusted = None
+            results.pop("forecast_adjusted", None)
+            results.pop("scenario_planned_overlay", None)
+            results.pop("scenario_set", None)
+            results.pop("scenario_exogenous_stub", None)
     else:
         st.session_state.fc_adjusted = None
         st.session_state.planned_overlay = None
@@ -3985,2179 +4032,2205 @@ if st.session_state.apply_scenarios and scenario_records and len(fc.index):
         results.pop("scenario_planned_overlay", None)
         results.pop("scenario_set", None)
         results.pop("scenario_exogenous_stub", None)
-else:
-    st.session_state.fc_adjusted = None
-    st.session_state.planned_overlay = None
-    st.session_state.combined_adjusted = None
-    results.pop("forecast_adjusted", None)
-    results.pop("scenario_planned_overlay", None)
-    results.pop("scenario_set", None)
-    results.pop("scenario_exogenous_stub", None)
 
-fc_adj = st.session_state.fc_adjusted
-planned_overlay = st.session_state.planned_overlay
-val_results = results.get("validation_results",{})
-weights = results.get("model_weights",{})
-rjpp_proximity = results.get("rjpp_proximity", {})
-naive_metrics = results.get("naive_holdout_metrics",{})
-naive_curve = results.get("naive_holdout_forecast")
-best_model = results.get("best_model")
-val_index = results.get("val_index")
-ens_val_pred = results.get("ensemble_val_pred")
-ens_val_metrics = results.get("ensemble_val_metrics")
-feat_imp = results.get("feature_importance",{})
-ensemble_choice = results.get("ensemble_choice","weighted")
-val_df_for_bundle = results.get("val_df")
-model_status = results.get("model_status",{})
-model_errors = results.get("model_errors",{})
-val_bands = results.get("val_bands")
-calibration_pct = results.get("calibration_pct")
-validation_windows = results.get("validation_windows", {})
+    fc_adj = st.session_state.fc_adjusted
+    planned_overlay = st.session_state.planned_overlay
+    val_results = results.get("validation_results",{})
+    weights = results.get("model_weights",{})
+    rjpp_proximity = results.get("rjpp_proximity", {})
+    naive_metrics = results.get("naive_holdout_metrics",{})
+    naive_curve = results.get("naive_holdout_forecast")
+    best_model = results.get("best_model")
+    val_index = results.get("val_index")
+    ens_val_pred = results.get("ensemble_val_pred")
+    ens_val_metrics = results.get("ensemble_val_metrics")
+    feat_imp = results.get("feature_importance",{})
+    ensemble_choice = results.get("ensemble_choice","weighted")
+    val_df_for_bundle = results.get("val_df")
+    model_status = results.get("model_status",{})
+    model_errors = results.get("model_errors",{})
+    val_bands = results.get("val_bands")
+    calibration_pct = results.get("calibration_pct")
+    validation_windows = results.get("validation_windows", {})
 
-has_rjpp = forecaster.use_rjpp and ("RJPP" in fc.columns)
+    rjpp_uncovered = results.get("rjpp_uncovered_months", pd.DatetimeIndex([]))
+    if not isinstance(rjpp_uncovered, pd.DatetimeIndex):
+        rjpp_uncovered = pd.to_datetime(pd.Index(rjpp_uncovered)) if len(rjpp_uncovered) else pd.DatetimeIndex([])
 
-# Display options (from PRESETS, no UI controls)
-show_bands = True  # Always show uncertainty bands
-bounded_bands = PRESETS["clamp_bands_to_rjpp"]  # Default False
+    has_rjpp = forecaster.use_rjpp and ("RJPP" in fc.columns)
+    rjpp_has_reference = bool(has_rjpp and fc["RJPP"].notna().any())
 
-# ---------- Tabs ----------
-tab_overview, tab_forecast, tab_models, tab_validation, tab_quality, tab_exports, tab_scenarios, tab_ai = st.tabs(
-    ["Overview", "Forecast", "Models", "Validation", "Data Quality", "Exports & Logs", "Scenarios", "AI Insight"]
-)
+    # Display options (from PRESETS, no UI controls)
+    show_bands = True  # Always show uncertainty bands
+    bounded_bands = PRESETS["clamp_bands_to_rjpp"]  # Default False
 
-# ---------- Overview ----------
-with tab_overview:
-    base_col = "p50" if "p50" in fc.columns else "Ensemble"
-    horizon = fc[base_col].astype(float) if len(fc) else pd.Series(dtype=float)
-    hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float) * 24 if len(fc) else pd.Series(dtype=float)
-    energy_mwh = horizon * hours if len(horizon) else pd.Series(dtype=float)
-    next_12_energy_gwh = float(energy_mwh.iloc[:12].sum() / 1000) if len(energy_mwh) else np.nan
-    next_12_avg = float(horizon.iloc[:12].mean()) if len(horizon) else np.nan
-
-    annual_mean_mw = horizon.groupby(fc.index.year).mean() if len(horizon) else pd.Series(dtype=float)
-    annual_energy_gwh = energy_mwh.groupby(fc.index.year).sum() / 1000 if len(energy_mwh) else pd.Series(dtype=float)
-    annual_peak_mw = horizon.groupby(fc.index.year).max() if len(horizon) else pd.Series(dtype=float)
-    annual_summary = pd.DataFrame({"Average_MW": annual_mean_mw, "Energy_GWh": annual_energy_gwh, "Peak_MW": annual_peak_mw})
-    if not annual_summary.empty:
-        annual_summary["Load_Factor"] = annual_summary["Average_MW"] / annual_summary["Peak_MW"].replace(0, np.nan)
-    annual_summary.index.name = "Year"
-
-    adj_col = None
-    adj_horizon = None
-    adj_energy_mwh = None
-    adj_next_12_avg = np.nan
-    adj_next_12_energy_gwh = np.nan
-    annual_mean_adj = pd.Series(dtype=float)
-    if fc_adj is not None:
-        if "p50_adj" in fc_adj.columns:
-            adj_col = "p50_adj"
-        elif "Ensemble_adj" in fc_adj.columns:
-            adj_col = "Ensemble_adj"
-        if adj_col:
-            adj_horizon = fc_adj[adj_col].astype(float)
-            if len(adj_horizon):
-                adj_energy_mwh = adj_horizon * hours
-                adj_next_12_avg = float(adj_horizon.iloc[:12].mean()) if len(adj_horizon) else np.nan
-                adj_next_12_energy_gwh = float(adj_energy_mwh.iloc[:12].sum() / 1000) if adj_energy_mwh is not None else np.nan
-                annual_mean_adj = adj_horizon.groupby(fc.index.year).mean()
-            else:
-                adj_energy_mwh = pd.Series(dtype=float)
-
-    cagr = _calc_cagr_series(horizon)
-    cagr_adj = _calc_cagr_series(adj_horizon) if adj_horizon is not None else None
-
-    # Apply display mode filter for overview plot
-    if display_mode == "History only":
-        comb_for_plot = combined.loc[:HISTORY_CUTOFF] if combined is not None else pd.Series(dtype=float)
-    elif display_mode == "Forecast only":
-        comb_for_plot = pd.concat([combined.loc[:HISTORY_CUTOFF].tail(1), horizon]) if combined is not None and len(horizon) else horizon
-    else:  # "Both"
-        comb_for_plot = combined if combined is not None else pd.Series(dtype=float)
-
-    def _fmt_val(value, fmt_str="{:,.0f}"):
-        try:
-            if value is None or not np.isfinite(value):
-                return "n/a"
-        except TypeError:
-            return "n/a"
-        return fmt_str.format(value)
-
-    def _fmt_delta_value(base_value, adj_value, fmt=".1f", suffix=""):
-        try:
-            if base_value is None or adj_value is None:
-                return None
-            if not np.isfinite(base_value) or not np.isfinite(adj_value):
-                return None
-        except TypeError:
-            return None
-        diff = adj_value - base_value
-        if abs(diff) < 1e-9:
-            return None
-        return f"{diff:+{fmt}}{suffix}"
-
-    comp_rate = None
-    breaches = 0
-    worst_gap = np.nan
-    worst_month = None
-    worst_dev = None
-    breach_first = None
-    breach_last = None
-    clamp_pct = np.nan
-    clamped_months = 0
-    first_clamp = None
-    last_clamp = None
-    anchor_rows = []
-    if has_rjpp:
-        dev = (fc["Ensemble"] - fc["RJPP"]) / fc["RJPP"] * 100
-        comp_rate = (dev.abs() <= (forecaster.max_dev * 100)).mean() * 100
-        breach_mask = dev.abs() > (forecaster.max_dev * 100)
-        breaches = int(breach_mask.sum())
-        if breaches:
-            worst_month = dev.abs().idxmax()
-            worst_dev = float(dev.loc[worst_month])
-            breach_dates = breach_mask[breach_mask].index
-            breach_first = breach_dates.min()
-            breach_last = breach_dates.max()
-        for y in sorted(fc.index.year.unique()):
-            mask = fc.index.year == y
-            yr_mean = fc.loc[mask, "Ensemble"].mean()
-            dec_val = fc.loc[fc.index == pd.Timestamp(y, 12, 1), "RJPP"]
-            if len(dec_val):
-                rjpp_dec = float(dec_val.values[0])
-                gap_pct = abs((yr_mean - rjpp_dec) / rjpp_dec) * 100 if rjpp_dec else np.nan
-                if np.isfinite(gap_pct):
-                    if gap_pct <= 1.0:
-                        status = "Pass"
-                    elif gap_pct <= 1.5:
-                        status = "Watch"
-                    else:
-                        status = "Fail"
-                else:
-                    status = "n/a"
-                anchor_rows.append({"Year": int(y), "Gap_%": gap_pct, "Status": status})
-        if anchor_rows:
-            finite_gaps = [row["Gap_%"] for row in anchor_rows if row["Gap_%"] is not None and np.isfinite(row["Gap_%"]) ]
-            if finite_gaps:
-                worst_gap = float(np.nanmax(finite_gaps))
-        lo = fc["RJPP"] * (1 - forecaster.max_dev)
-        hi = fc["RJPP"] * (1 + forecaster.max_dev)
-        tol = np.maximum(fc["RJPP"].abs() * 0.002, 0.5)
-        clamp_mask = ((fc["Ensemble"] - lo).abs() <= tol) | ((fc["Ensemble"] - hi).abs() <= tol)
-        clamped_months = int(clamp_mask.sum())
-        clamp_pct = float(clamp_mask.mean() * 100) if len(clamp_mask) else np.nan
-        if clamped_months:
-            clamp_indices = clamp_mask[clamp_mask].index
-            first_clamp = clamp_indices.min()
-            last_clamp = clamp_indices.max()
-
-    comp_display = _fmt_val(comp_rate, "{:.1f}%") if comp_rate is not None else "n/a"
-    comp_rate_adj = None
-    if has_rjpp and adj_horizon is not None:
-        comp_rate_adj = _compute_rjpp_compliance(adj_horizon, fc, forecaster.max_dev)
-    comp_display_adj = _fmt_val(comp_rate_adj, "{:.1f}%") if comp_rate_adj is not None else "n/a"
-
-    ensemble_rmse = None
-    if ens_val_metrics and "RMSE" in ens_val_metrics:
-        ensemble_rmse = ens_val_metrics["RMSE"]
-    naive_rmse = naive_metrics.get("RMSE") if naive_metrics else None
-    rmse_value = "n/a"
-    rmse_delta = None
-    if ensemble_rmse is not None and np.isfinite(ensemble_rmse):
-        rmse_value = f"{ensemble_rmse:.2f}"
-        if naive_rmse is not None and np.isfinite(naive_rmse) and naive_rmse > 0:
-            rmse_delta = f"{((naive_rmse - ensemble_rmse)/naive_rmse)*100:+.1f}%"
-
-    band_display = _fmt_val(calibration_pct, "{:.1f}%")
-
-    first_metrics = []
-    first_metrics.append(("Next-12m Energy (GWh)", _fmt_val(next_12_energy_gwh, "{:,.1f}"), _fmt_delta_value(next_12_energy_gwh, adj_next_12_energy_gwh, ".1f", " GWh") if adj_horizon is not None else None))
-    first_metrics.append(("Next-12m Avg (p50)", _fmt_val(next_12_avg, "{:,.0f}"), _fmt_delta_value(next_12_avg, adj_next_12_avg, ".0f", " MW") if adj_horizon is not None else None))
-    if has_rjpp:
-        comp_delta = _fmt_delta_value(comp_rate, comp_rate_adj, ".1f", "%") if comp_rate_adj is not None else None
-        first_metrics.append(("RJPP Compliance", comp_display, comp_delta))
-        clamp_display = "n/a"
-        if clamped_months and np.isfinite(clamp_pct):
-            clamp_display = f"{clamped_months} ({clamp_pct:.1f}%)"
-        elif np.isfinite(clamp_pct):
-            clamp_display = "0"
-        first_metrics.append(("Clamped Months", clamp_display, None))
-    else:
-        cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
-        cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
-        first_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
-
-    second_metrics = []
-    if has_rjpp:
-        cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
-        cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
-        second_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
-        second_metrics.append(("Band Calibration (p10-90)", band_display, None))
-        second_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
-    else:
-        second_metrics.append(("Band Calibration (p10-90)", band_display, None))
-        second_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
-
-    trend_msgs = []
-    if cagr is not None and np.isfinite(cagr):
-        trend_msgs.append(_trend_label_from_cagr(cagr))
-    if cagr_adj is not None and np.isfinite(cagr_adj):
-        trend_msgs.append(f"Scenario {_trend_label_from_cagr(cagr_adj)}")
-
-    st.subheader("Main forecast")
-    if trend_msgs:
-        st.caption("Trend snapshot: " + " | ".join(trend_msgs))
-
-    plot_hero(
-        comb_for_plot.to_frame("Combined"),
-        fc,
-        rjpp_full if has_rjpp else None,
-        key_suffix="overview",
-        show_bands=False,
-        bounded=bounded_bands,
-        max_dev=forecaster.max_dev,
-        fc_adj=fc_adj,
-        combined_adj=st.session_state.combined_adjusted,
-        planned_overlay=planned_overlay,
-        forecast_start=forecast_start_ts,
+    # ---------- Tabs ----------
+    tab_overview, tab_forecast, tab_models, tab_validation, tab_quality, tab_exports, tab_scenarios, tab_ai = st.tabs(
+        ["Overview", "Forecast", "Models", "Validation", "Data Quality", "Exports & Logs", "Scenarios", "AI Insight"]
     )
-    # Explain for hero chart
-    with st.expander("ℹ Explain", expanded=False):
-        txt = GLOSSARY.get("Band calibration (p10–p90)") or "Forecast bands show p10–p90 uncertainty."
+
+    # Provide RJPP coverage notices up front
+    if has_rjpp:
+        if not rjpp_has_reference:
+            st.warning("RJPP reference data is unavailable within the selected horizon; compliance KPIs are reported as n/a beyond the RJPP file.")
+        elif len(rjpp_uncovered):
+            cutoff_month = rjpp_uncovered.min().strftime("%Y-%m")
+            st.warning(f"RJPP reference ends at {cutoff_month}. Forecast months beyond this point are unconstrained by RJPP and compliance deltas will show as n/a.")
+
+    # ---------- Overview ----------
+    with tab_overview:
+        base_col = "p50" if "p50" in fc.columns else "Ensemble"
+        horizon = fc[base_col].astype(float) if len(fc) else pd.Series(dtype=float)
+        hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float) * 24 if len(fc) else pd.Series(dtype=float)
+        energy_mwh = horizon * hours if len(horizon) else pd.Series(dtype=float)
+        next_12_energy_gwh = float(energy_mwh.iloc[:12].sum() / 1000) if len(energy_mwh) else np.nan
+        next_12_avg = float(horizon.iloc[:12].mean()) if len(horizon) else np.nan
+
+        annual_mean_mw = horizon.groupby(fc.index.year).mean() if len(horizon) else pd.Series(dtype=float)
+        annual_energy_gwh = energy_mwh.groupby(fc.index.year).sum() / 1000 if len(energy_mwh) else pd.Series(dtype=float)
+        annual_peak_mw = horizon.groupby(fc.index.year).max() if len(horizon) else pd.Series(dtype=float)
+        annual_summary = pd.DataFrame({"Average_MW": annual_mean_mw, "Energy_GWh": annual_energy_gwh, "Peak_MW": annual_peak_mw})
+        if not annual_summary.empty:
+            annual_summary["Load_Factor"] = annual_summary["Average_MW"] / annual_summary["Peak_MW"].replace(0, np.nan)
+        annual_summary.index.name = "Year"
+
+        adj_col = None
+        adj_horizon = None
+        adj_energy_mwh = None
+        adj_next_12_avg = np.nan
+        adj_next_12_energy_gwh = np.nan
+        annual_mean_adj = pd.Series(dtype=float)
+        if fc_adj is not None:
+            if "p50_adj" in fc_adj.columns:
+                adj_col = "p50_adj"
+            elif "Ensemble_adj" in fc_adj.columns:
+                adj_col = "Ensemble_adj"
+            if adj_col:
+                adj_horizon = fc_adj[adj_col].astype(float)
+                if len(adj_horizon):
+                    adj_energy_mwh = adj_horizon * hours
+                    adj_next_12_avg = float(adj_horizon.iloc[:12].mean()) if len(adj_horizon) else np.nan
+                    adj_next_12_energy_gwh = float(adj_energy_mwh.iloc[:12].sum() / 1000) if adj_energy_mwh is not None else np.nan
+                    annual_mean_adj = adj_horizon.groupby(fc.index.year).mean()
+                else:
+                    adj_energy_mwh = pd.Series(dtype=float)
+
+        cagr = _calc_cagr_series(horizon)
+        cagr_adj = _calc_cagr_series(adj_horizon) if adj_horizon is not None else None
+
+        # Apply display mode filter for overview plot
+        if display_mode == "History only":
+            comb_for_plot = combined.loc[:HISTORY_CUTOFF] if combined is not None else pd.Series(dtype=float)
+        elif display_mode == "Forecast only":
+            comb_for_plot = pd.concat([combined.loc[:HISTORY_CUTOFF].tail(1), horizon]) if combined is not None and len(horizon) else horizon
+        else:  # "Both"
+            comb_for_plot = combined if combined is not None else pd.Series(dtype=float)
+
+        def _fmt_val(value, fmt_str="{:,.0f}"):
+            try:
+                if value is None or not np.isfinite(value):
+                    return "n/a"
+            except TypeError:
+                return "n/a"
+            return fmt_str.format(value)
+
+        def _fmt_delta_value(base_value, adj_value, fmt=".1f", suffix=""):
+            try:
+                if base_value is None or adj_value is None:
+                    return None
+                if not np.isfinite(base_value) or not np.isfinite(adj_value):
+                    return None
+            except TypeError:
+                return None
+            diff = adj_value - base_value
+            if abs(diff) < 1e-9:
+                return None
+            return f"{diff:+{fmt}}{suffix}"
+
+        comp_rate = None
+        breaches = 0
+        worst_gap = np.nan
+        worst_month = None
+        worst_dev = None
+        breach_first = None
+        breach_last = None
+        clamp_pct = np.nan
+        clamped_months = 0
+        first_clamp = None
+        last_clamp = None
+        anchor_rows = []
         if has_rjpp:
-            txt = txt + " " + (GLOSSARY.get("RJPP compliance") or "RJPP shows regulator baseline.")
-        st.write(txt)
+            rjpp_valid_mask = fc["RJPP"].notna()
+            fc_r = fc.loc[rjpp_valid_mask]
+            if not fc_r.empty:
+                dev = (fc_r["Ensemble"] - fc_r["RJPP"]) / fc_r["RJPP"] * 100
+                comp_rate = (dev.abs() <= (forecaster.max_dev * 100)).mean() * 100
+                breach_mask = dev.abs() > (forecaster.max_dev * 100)
+                breaches = int(breach_mask.sum())
+                if breaches:
+                    worst_month = dev.abs().idxmax()
+                    worst_dev = float(dev.loc[worst_month])
+                    breach_dates = breach_mask[breach_mask].index
+                    breach_first = breach_dates.min()
+                    breach_last = breach_dates.max()
+                for y in sorted(fc_r.index.year.unique()):
+                    mask = fc_r.index.year == y
+                    yr_mean = fc_r.loc[mask, "Ensemble"].mean()
+                    dec_val = fc_r.loc[fc_r.index == pd.Timestamp(y, 12, 1), "RJPP"]
+                    if len(dec_val):
+                        rjpp_dec = float(dec_val.values[0])
+                        gap_pct = abs((yr_mean - rjpp_dec) / rjpp_dec) * 100 if rjpp_dec else np.nan
+                        if np.isfinite(gap_pct):
+                            if gap_pct <= 1.0:
+                                status = "Pass"
+                            elif gap_pct <= 1.5:
+                                status = "Watch"
+                            else:
+                                status = "Fail"
+                        else:
+                            status = "n/a"
+                        anchor_rows.append({"Year": int(y), "Gap_%": gap_pct, "Status": status})
+                if anchor_rows:
+                    finite_gaps = [row["Gap_%"] for row in anchor_rows if row["Gap_%"] is not None and np.isfinite(row["Gap_%"]) ]
+                    if finite_gaps:
+                        worst_gap = float(np.nanmax(finite_gaps))
+                lo = fc_r["RJPP"] * (1 - forecaster.max_dev)
+                hi = fc_r["RJPP"] * (1 + forecaster.max_dev)
+                tol = np.maximum(fc_r["RJPP"].abs() * 0.002, 0.5)
+                clamp_mask = ((fc_r["Ensemble"] - lo).abs() <= tol) | ((fc_r["Ensemble"] - hi).abs() <= tol)
+                clamped_months = int(clamp_mask.sum())
+                clamp_pct = float(clamp_mask.mean() * 100) if len(clamp_mask) else np.nan
+                if clamped_months:
+                    clamp_indices = clamp_mask[clamp_mask].index
+                    first_clamp = clamp_indices.min()
+                    last_clamp = clamp_indices.max()
 
-    primary_metrics = []
-    primary_metrics.append(("Next-12m Energy (GWh)", _fmt_val(next_12_energy_gwh, "{:,.1f}"), _fmt_delta_value(next_12_energy_gwh, adj_next_12_energy_gwh, ".1f", " GWh") if adj_horizon is not None else None))
-    primary_metrics.append(("Next-12m Avg (p50)", _fmt_val(next_12_avg, "{:,.0f}"), _fmt_delta_value(next_12_avg, adj_next_12_avg, ".0f", " MW") if adj_horizon is not None else None))
-    if has_rjpp:
-        comp_delta = _fmt_delta_value(comp_rate, comp_rate_adj, ".1f", "%") if comp_rate_adj is not None else None
-        primary_metrics.append(("RJPP Compliance", comp_display, comp_delta))
-    
-    # Add comprehensive RJPP metrics if available
-    rjpp_detailed_metrics = results.get("rjpp_metrics", {})
-    if rjpp_detailed_metrics:
-        comp_rate_detailed = rjpp_detailed_metrics.get("compliance_rate_pct")
-        mean_dev_detailed = rjpp_detailed_metrics.get("mean_abs_deviation_pct")
-        worst_dev_detailed = rjpp_detailed_metrics.get("worst_deviation_pct")
-        mean_bias = rjpp_detailed_metrics.get("mean_bias_pct")
-        if comp_rate_detailed is not None:
-            # Update primary compliance display with more precise value
-            comp_display = f"{comp_rate_detailed:.1f}%"
-            primary_metrics[-1] = ("RJPP Compliance", comp_display, comp_delta)
+        comp_display = _fmt_val(comp_rate, "{:.1f}%") if comp_rate is not None else "n/a"
+        comp_rate_adj = None
+        if has_rjpp and adj_horizon is not None:
+            comp_rate_adj = _compute_rjpp_compliance(adj_horizon, fc, forecaster.max_dev)
+        comp_display_adj = _fmt_val(comp_rate_adj, "{:.1f}%") if comp_rate_adj is not None else "n/a"
 
-    st.markdown("### Primary KPIs")
-    cols_primary = st.columns(len(primary_metrics)) if primary_metrics else []
-    for col, (label, value, delta) in zip(cols_primary, primary_metrics):
-        if delta is not None:
-            show_metric(col, label, value, delta=delta, explain_on=explain_on)
+        ensemble_rmse = None
+        if ens_val_metrics and "RMSE" in ens_val_metrics:
+            ensemble_rmse = ens_val_metrics["RMSE"]
+        naive_rmse = naive_metrics.get("RMSE") if naive_metrics else None
+        rmse_value = "n/a"
+        rmse_delta = None
+        if ensemble_rmse is not None and np.isfinite(ensemble_rmse):
+            rmse_value = f"{ensemble_rmse:.2f}"
+            if naive_rmse is not None and np.isfinite(naive_rmse) and naive_rmse > 0:
+                rmse_delta = f"{((naive_rmse - ensemble_rmse)/naive_rmse)*100:+.1f}%"
+
+        band_display = _fmt_val(calibration_pct, "{:.1f}%")
+
+        first_metrics = []
+        first_metrics.append(("Next-12m Energy (GWh)", _fmt_val(next_12_energy_gwh, "{:,.1f}"), _fmt_delta_value(next_12_energy_gwh, adj_next_12_energy_gwh, ".1f", " GWh") if adj_horizon is not None else None))
+        first_metrics.append(("Next-12m Avg (p50)", _fmt_val(next_12_avg, "{:,.0f}"), _fmt_delta_value(next_12_avg, adj_next_12_avg, ".0f", " MW") if adj_horizon is not None else None))
+        if has_rjpp:
+            comp_delta = _fmt_delta_value(comp_rate, comp_rate_adj, ".1f", "%") if comp_rate_adj is not None else None
+            first_metrics.append(("RJPP Compliance", comp_display, comp_delta))
+            clamp_display = "n/a"
+            if clamped_months and np.isfinite(clamp_pct):
+                clamp_display = f"{clamped_months} ({clamp_pct:.1f}%)"
+            elif np.isfinite(clamp_pct):
+                clamp_display = "0"
+            first_metrics.append(("Clamped Months", clamp_display, None))
         else:
-            show_metric(col, label, value, explain_on=explain_on)
+            cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
+            cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
+            first_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
 
-    secondary_metrics = []
-    if has_rjpp:
-        cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
-        cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
-        secondary_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
-        secondary_metrics.append(("Band Calibration (p10-90)", band_display, None))
-        secondary_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
-        
-        # Add detailed RJPP metrics if available
-        if rjpp_detailed_metrics:
+        second_metrics = []
+        if has_rjpp:
+            cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
+            cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
+            second_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
+            second_metrics.append(("Band Calibration (p10-90)", band_display, None))
+            second_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
+        else:
+            second_metrics.append(("Band Calibration (p10-90)", band_display, None))
+            second_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
+
+        trend_msgs = []
+        if cagr is not None and np.isfinite(cagr):
+            trend_msgs.append(_trend_label_from_cagr(cagr))
+        if cagr_adj is not None and np.isfinite(cagr_adj):
+            trend_msgs.append(f"Scenario {_trend_label_from_cagr(cagr_adj)}")
+
+        st.subheader("Main forecast")
+        if trend_msgs:
+            st.caption("Trend snapshot: " + " | ".join(trend_msgs))
+
+        plot_hero(
+            comb_for_plot.to_frame("Combined"),
+            fc,
+            rjpp_full if has_rjpp else None,
+            key_suffix="overview",
+            show_bands=False,
+            bounded=bounded_bands,
+            max_dev=forecaster.max_dev,
+            fc_adj=fc_adj,
+            combined_adj=st.session_state.combined_adjusted,
+            planned_overlay=planned_overlay,
+            forecast_start=forecast_start_ts,
+        )
+        # Explain for hero chart
+        with st.expander("ℹ Explain", expanded=False):
+            txt = GLOSSARY.get("Band calibration (p10-90)") or "Forecast bands show p10-90 uncertainty."
+            if has_rjpp:
+                txt = txt + " " + (GLOSSARY.get("RJPP compliance") or "RJPP shows regulator baseline.")
+            st.write(txt)
+
+        primary_metrics = []
+        primary_metrics.append(("Next-12m Energy (GWh)", _fmt_val(next_12_energy_gwh, "{:,.1f}"), _fmt_delta_value(next_12_energy_gwh, adj_next_12_energy_gwh, ".1f", " GWh") if adj_horizon is not None else None))
+        primary_metrics.append(("Next-12m Avg (p50)", _fmt_val(next_12_avg, "{:,.0f}"), _fmt_delta_value(next_12_avg, adj_next_12_avg, ".0f", " MW") if adj_horizon is not None else None))
+        if rjpp_has_reference:
+            comp_delta = _fmt_delta_value(comp_rate, comp_rate_adj, ".1f", "%") if comp_rate_adj is not None else None
+            primary_metrics.append(("RJPP Compliance", comp_display, comp_delta))
+
+        # Add comprehensive RJPP metrics if available
+        rjpp_detailed_metrics = results.get("rjpp_metrics", {})
+        if rjpp_has_reference and rjpp_detailed_metrics:
+            comp_rate_detailed = rjpp_detailed_metrics.get("compliance_rate_pct")
             mean_dev_detailed = rjpp_detailed_metrics.get("mean_abs_deviation_pct")
             worst_dev_detailed = rjpp_detailed_metrics.get("worst_deviation_pct")
             mean_bias = rjpp_detailed_metrics.get("mean_bias_pct")
-            worst_month_str = rjpp_detailed_metrics.get("worst_month", "n/a")
-            
-            if mean_dev_detailed is not None:
-                secondary_metrics.append(("Mean RJPP Deviation", f"{mean_dev_detailed:.2f}%", None))
-            if worst_dev_detailed is not None:
-                secondary_metrics.append(("Worst RJPP Deviation", f"{worst_dev_detailed:.1f}% ({worst_month_str})", None))
-            if mean_bias is not None:
-                bias_label = "Over-forecast" if mean_bias > 0 else "Under-forecast"
-                secondary_metrics.append((f"Mean Bias ({bias_label})", f"{abs(mean_bias):.2f}%", None))
-        else:
-            worst_gap_display = _fmt_val(worst_gap, "{:.2f}%") if np.isfinite(worst_gap) else "n/a"
-            secondary_metrics.append(("Worst Annual Gap", worst_gap_display, None))
+            if comp_rate_detailed is not None:
+                # Update primary compliance display with more precise value
+                comp_display = f"{comp_rate_detailed:.1f}%"
+                primary_metrics[-1] = ("RJPP Compliance", comp_display, comp_delta)
+
+        st.markdown("### Primary KPIs")
+        cols_primary = st.columns(len(primary_metrics)) if primary_metrics else []
+        for col, (label, value, delta) in zip(cols_primary, primary_metrics):
+            if delta is not None:
+                show_metric(col, label, value, delta=delta, explain_on=explain_on)
+            else:
+                show_metric(col, label, value, explain_on=explain_on)
+
+        secondary_metrics = []
+        if rjpp_has_reference:
+            cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
+            cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
+            secondary_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
+            secondary_metrics.append(("Band Calibration (p10-90)", band_display, None))
+            secondary_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
+
+            # Add detailed RJPP metrics if available
+            if rjpp_detailed_metrics:
+                mean_dev_detailed = rjpp_detailed_metrics.get("mean_abs_deviation_pct")
+                worst_dev_detailed = rjpp_detailed_metrics.get("worst_deviation_pct")
+                mean_bias = rjpp_detailed_metrics.get("mean_bias_pct")
+                worst_month_str = rjpp_detailed_metrics.get("worst_month", "n/a")
+
+                if mean_dev_detailed is not None:
+                    secondary_metrics.append(("Mean RJPP Deviation", f"{mean_dev_detailed:.2f}%", None))
+                if worst_dev_detailed is not None:
+                    secondary_metrics.append(("Worst RJPP Deviation", f"{worst_dev_detailed:.1f}% ({worst_month_str})", None))
+                if mean_bias is not None:
+                    bias_label = "Over-forecast" if mean_bias > 0 else "Under-forecast"
+                    secondary_metrics.append((f"Mean Bias ({bias_label})", f"{abs(mean_bias):.2f}%", None))
+        elif has_rjpp:
+            # RJPP was requested but not available for current horizon
+            secondary_metrics.append(("RJPP Coverage", "n/a", None))
         
-        clamp_display = "n/a"
-        if clamped_months and np.isfinite(clamp_pct):
-            clamp_display = f"{clamped_months} ({clamp_pct:.1f}%)"
-        elif np.isfinite(clamp_pct):
-            clamp_display = "0"
-        secondary_metrics.append(("Clamped Months", clamp_display, None))
-    else:
-        cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
-        cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
-        secondary_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
-        secondary_metrics.append(("Band Calibration (p10-90)", band_display, None))
-        secondary_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
-
-    with st.expander("More KPIs", expanded=False):
-        if secondary_metrics:
-            for chunk_start in range(0, len(secondary_metrics), 3):
-                cols_sec = st.columns(min(3, len(secondary_metrics) - chunk_start))
-                for col, (label, value, delta) in zip(cols_sec, secondary_metrics[chunk_start:chunk_start + 3]):
-                    if delta is not None:
-                        show_metric(col, label, value, delta=delta, explain_on=explain_on)
-                    else:
-                        show_metric(col, label, value, explain_on=explain_on)
+            clamp_display = "n/a"
+            if clamped_months and np.isfinite(clamp_pct):
+                clamp_display = f"{clamped_months} ({clamp_pct:.1f}%)"
+            elif np.isfinite(clamp_pct):
+                clamp_display = "0"
+            secondary_metrics.append(("Clamped Months", clamp_display, None))
         else:
-            st.caption("No secondary KPIs available.")
+            cagr_display = _fmt_val(cagr * 100, "{:.2f}%") if cagr is not None else "n/a"
+            cagr_delta = _fmt_delta_value(cagr * 100 if cagr is not None else np.nan, cagr_adj * 100 if cagr_adj is not None else np.nan, ".2f", "%") if cagr_adj is not None else None
+            secondary_metrics.append(("Horizon CAGR", cagr_display, cagr_delta))
+            secondary_metrics.append(("Band Calibration (p10-90)", band_display, None))
+            secondary_metrics.append(("Validation RMSE", rmse_value, rmse_delta))
 
-    caption_bits = []
-    caption_bits.append(f"Ensemble selection: **{ensemble_choice}**")
-    if has_rjpp and comp_rate is not None:
-        compliance_text = f"RJPP compliance base **{comp_display}**"
-        if comp_rate_adj is not None and np.isfinite(comp_rate_adj):
-            compliance_text += f" | scenario **{comp_display_adj}**"
-        caption_bits.append(compliance_text)
-    if has_rjpp and clamped_months:
-        clamp_window = f"{first_clamp:%Y-%m} – {last_clamp:%Y-%m}" if first_clamp and last_clamp else "multiple months"
-        clamp_pct_display = _fmt_val(clamp_pct, "{:.1f}%")
-        caption_bits.append(f"Clamped months **{clamped_months}** (~{clamp_pct_display}) {clamp_window}")
-    if has_rjpp and np.isfinite(worst_gap):
-        caption_bits.append(f"Worst annual gap **{_fmt_val(worst_gap, '{:.2f}%')}**")
-    st.caption("; ".join(caption_bits))
-
-    kpi_lines = [
-        "# Key KPIs",
-        f"- Next-12m Energy (GWh): {fmt_gwh(next_12_energy_gwh)}",
-        f"- Next-12m Avg (p50): {fmt_mw(next_12_avg)}",
-        f"- RJPP Compliance: {fmt_pct(comp_rate if comp_rate is not None else np.nan)}",
-        f"- Clamped Months: {clamped_months} ({fmt_pct(clamp_pct)})",
-        f"- Band Calibration (p10-90): {fmt_pct(calibration_pct if calibration_pct is not None else np.nan)}",
-    ]
-    if ensemble_rmse is not None:
-        kpi_lines.append(f"- Validation RMSE: {ensemble_rmse:.2f}")
-    else:
-        kpi_lines.append("- Validation RMSE: n/a")
-    kpi_md = "\n".join(kpi_lines)
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Copy KPIs"):
-            try:
-                import importlib
-                pyperclip = importlib.import_module("pyperclip")
-                pyperclip.copy(kpi_md)
-                st.success("KPIs copied to clipboard")
-            except Exception:
-                st.info("KPIs available for download")
-                st.download_button("Download KPIs (.md)", kpi_md, f"kpis_{datetime.now().strftime('%Y-%m-%d')}.md", "text/markdown")
-    with c2:
-        if st.button("Reset to defaults"):
-            for k in ["display_mode", "show_bands", "bounded_bands", "explain_mode"]:
-                if k in st.session_state:
-                    st.session_state.pop(k, None)
-            st.experimental_rerun()
-
-    anchor_df = pd.DataFrame(anchor_rows).set_index("Year") if anchor_rows else pd.DataFrame()
-    if not annual_summary.empty or (has_rjpp and not anchor_df.empty):
-        st.subheader("Annual Summary & Health Checks")
-        col_summary, col_health = st.columns([2, 1])
-        if not annual_summary.empty:
-            col_summary.dataframe(
-                annual_summary.reset_index().style.format({
-                    "Average_MW": "{:,.0f}",
-                    "Energy_GWh": "{:,.1f}",
-                    "Peak_MW": "{:,.0f}",
-                    "Load_Factor": "{:.3f}"
-                }),
-                use_container_width=True,
-            )
-        if has_rjpp and not anchor_df.empty:
-            show_metric(col_health, "Worst Annual Gap", _fmt_val(worst_gap, "{:.2f}%"), explain_on=explain_on)
-            col_health.dataframe(anchor_df.style.format({"Gap_%": "{:.2f}"}), use_container_width=True)
-        else:
-            col_health.caption("No RJPP anchor diagnostics available.")
-
-with tab_forecast:
-    st.subheader("Forecast")
-    plot_hero(
-        combined.to_frame("Combined"),
-        fc,
-        rjpp_full if has_rjpp else None,
-        key_suffix="forecast",
-        show_bands=show_bands,
-        bounded=bounded_bands,
-        max_dev=forecaster.max_dev,
-        fc_adj=fc_adj,
-        combined_adj=st.session_state.combined_adjusted,
-        planned_overlay=planned_overlay,
-        forecast_start=forecast_start_ts,
-    )
-    with st.expander("ℹ Explain", expanded=False):
-        st.write(GLOSSARY.get("Band calibration (p10–p90)") or "Forecast shows p50 with p10–p90 uncertainty bands. Units: MW.")
-
-    # Annual Delta Chart (Base vs Scenario-Adjusted)
-    if fc_adj is not None and len(fc.index):
-        base_col = "p50" if "p50" in fc.columns else "Ensemble"
-        adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else "Ensemble_adj"
-        if adj_col in fc_adj.columns:
-            st.subheader("Annual Impact: Scenario vs Base")
-            
-            # Calculate annual means
-            fc_annual = fc.groupby(fc.index.year)[base_col].mean()
-            fc_adj_annual = fc_adj.groupby(fc_adj.index.year)[adj_col].mean()
-            
-            annual_delta_mw = fc_adj_annual - fc_annual.reindex(fc_adj_annual.index)
-            annual_delta_pct = (annual_delta_mw / fc_annual.reindex(fc_adj_annual.index) * 100).replace([np.inf, -np.inf], np.nan)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig_delta_mw = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-                colors = ['green' if x >= 0 else 'red' for x in annual_delta_mw.values]
-                fig_delta_mw.add_trace(go.Bar(
-                    x=annual_delta_mw.index.astype(str),
-                    y=annual_delta_mw.values,
-                    marker_color=colors,
-                    name="Delta MW"
-                ))
-                fig_delta_mw.update_yaxes(title_text="Annual Average Delta (MW)")
-                fig_delta_mw.update_layout(title_text="Scenario Impact (MW)")
-                st.plotly_chart(fig_delta_mw, use_container_width=True, key="annual_delta_mw")
-            
-            with col2:
-                fig_delta_pct = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-                colors = ['green' if x >= 0 else 'red' for x in annual_delta_pct.dropna().values]
-                fig_delta_pct.add_trace(go.Bar(
-                    x=annual_delta_pct.dropna().index.astype(str),
-                    y=annual_delta_pct.dropna().values,
-                    marker_color=colors,
-                    name="Delta %"
-                ))
-                fig_delta_pct.update_yaxes(title_text="Annual Average Delta (%)", ticksuffix=" %")
-                fig_delta_pct.update_layout(title_text="Scenario Impact (%)")
-                st.plotly_chart(fig_delta_pct, use_container_width=True, key="annual_delta_pct")
-
-    if has_rjpp and "Ensemble" in fc:
-        st.subheader("RJPP Deviation by Month (signed)")
-        dev = (fc["Ensemble"] - fc["RJPP"]) / fc["RJPP"] * 100
-        highlight_top = st.toggle("Show only worst deviations", value=False, key="rjpp_highlight_top")
-        plot_series = dev
-        title_suffix = ""
-        if highlight_top:
-            top_n = st.selectbox("Top N months", options=[6, 12, 24], index=0, key="rjpp_top_n")
-            selected_index = dev.abs().sort_values(ascending=False).index[:top_n]
-            plot_series = dev.loc[selected_index].sort_index()
-            title_suffix = f" (top {top_n})"
-        colors = [PALETTE["good"] if abs(v) <= forecaster.max_dev * 100 else (PALETTE["warn"] if abs(v) <= forecaster.max_dev * 150 else PALETTE["bad"]) for v in plot_series]
-        figd = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-        figd.add_trace(go.Bar(x=plot_series.index, y=plot_series.values, marker_color=colors, name="Deviation %"))
-        figd.add_hline(y=forecaster.max_dev*100, line_dash="dot", line_color="red", annotation_text="+/- max_dev")
-        figd.add_hline(y=-forecaster.max_dev*100, line_dash="dot", line_color="red")
-        figd.update_yaxes(ticksuffix=" %", title_text="Deviation (%)")
-        figd.update_layout(title_text=f"RJPP Deviation by Month{title_suffix}")
-        st.plotly_chart(figd, use_container_width=True, key="rjpp_dev_month_bar")
-        with st.expander("ℹ Explain", expanded=False):
-            st.write("Bars show monthly % deviation vs RJPP. Dotted lines are +/- bound. Colors: green within bound, amber near limit, red outside.")
-
-
-# ---------- Models ----------
-with tab_models:
-    st.subheader("Training controls")
-    prev_params = st.session_state.training_params.copy()
-    col_tc1, col_tc2, col_tc3, col_tc4 = st.columns(4)
-    val_months_sel = col_tc1.slider(
-        "Validation months",
-        min_value=6,
-        max_value=36,
-        value=int(prev_params.get("val_months", DEFAULT_VAL_MONTHS)),
-        step=1,
-    )
-    rolling_k_sel = col_tc2.slider(
-        "Rolling windows (K)",
-        min_value=1,
-        max_value=6,
-        value=int(prev_params.get("rolling_k", DEFAULT_ROLLING_K)),
-        step=1,
-    )
-    mom_quant_sel = col_tc3.slider(
-        "MoM cap quantile",
-        min_value=0.80,
-        max_value=0.98,
-        value=float(prev_params.get("mom_limit_quantile", 0.90)),
-        step=0.01,
-    )
-    max_dev_sel = col_tc4.slider(
-        "RJPP ± deviation",
-        min_value=0.01,
-        max_value=0.10,
-        value=float(prev_params.get("max_dev", DEFAULT_MAX_DEV)),
-        step=0.005,
-        format="%.3f",
-    )
-    st.session_state.training_params.update(
-        {
-            "val_months": int(val_months_sel),
-            "rolling_k": int(rolling_k_sel),
-            "mom_limit_quantile": float(round(mom_quant_sel, 2)),
-            "max_dev": float(round(max_dev_sel, 3)),
-        }
-    )
-    if st.session_state.training_params != prev_params:
-        st.session_state.training_params_dirty = True
-    if st.session_state.training_params_dirty:
-        st.info("Training settings changed. Re-run the forecast to apply updates.")
-
-    st.subheader("Per-Model Forecasts (horizon only)")
-    st.caption("Raw model outputs before RJPP alignment, noise, and clipping.")
-    plot_per_model(combined, fc, fc_raw, rjpp_full if has_rjpp else None, forecaster.slot_info)
-
-    metric_options = {"RMSE": "RMSE", "MAE": "MAE", "sMAPE": "sMAPE"}
-    st.session_state.setdefault("leaderboard_metric", "RMSE")
-    selected_metric_label = st.session_state.get("leaderboard_metric", "RMSE")
-    st.subheader(f"Model Leaderboard ({selected_metric_label})")
-    st.caption("Sorted ascending; lower values indicate better validation fit.")
-    with st.expander("More metrics", expanded=False):
-        st.markdown("Switch the leaderboard metric or review metric definitions.")
-        selected_metric_label = st.radio(
-            "Leaderboard metric",
-            list(metric_options.keys()),
-            index=list(metric_options.keys()).index(st.session_state.get("leaderboard_metric", "RMSE")),
-            key="leaderboard_metric",
-        )
-        gloss_lines = []
-        for label, column in metric_options.items():
-            gloss_key = _find_glossary_key(column)
-            desc = GLOSSARY.get(gloss_key) if gloss_key else None
-            if desc:
-                gloss_lines.append(f"- **{label}**: {desc}")
-        if gloss_lines:
-            st.markdown("\n".join(gloss_lines))
-    metric_key = metric_options[st.session_state.get("leaderboard_metric", "RMSE")]
-    if has_rjpp and rjpp_proximity:
-        prox_df = pd.DataFrame(rjpp_proximity).T.rename(columns={"mean_signed_pct": "Mean signed %", "pct_within_5": "% within \u00b15%"})
-        st.caption("RJPP proximity diagnostics (raw model outputs)")
-        st.dataframe(prox_df.style.format({"Mean signed %": "{:.2f}%", "% within \u00b15%": "{:.1f}%"}), use_container_width=True)
-    if val_results:
-        show_baseline = st.checkbox("Show baseline (Naive) in leaderboard", value=False, key="show_baseline_leaderboard")
-        dfv = pd.DataFrame(val_results).T
-        if not show_baseline and "Naive" in dfv.index:
-            dfv = dfv.drop(index="Naive")
-        if not dfv.empty:
-            sort_metric = metric_key if metric_key in dfv.columns else "RMSE"
-            dfv = dfv.sort_values(sort_metric)
-            chart_df = dfv.head(5).reset_index()
-            y_axis = sort_metric
-            chart_df["Model"] = chart_df["index"].map(lambda name: forecaster.slot_info.get(name, {}).get("impl", name))
-            st.plotly_chart(
-                px.bar(chart_df, x="Model", y=y_axis, labels={"Model": "Model", y_axis: y_axis}),
-                use_container_width=True,
-                key="model_leaderboard_bar",
-            )
-            impl_col = [forecaster.slot_info.get(idx, {}).get("impl", "") for idx in dfv.index]
-            dfv.insert(0, "Implementation", impl_col)
-            numeric_cols = dfv.select_dtypes(include=[np.number]).columns
-            st.dataframe(dfv.style.format({col: "{:.3f}" for col in numeric_cols}), use_container_width=True)
-        else:
-            st.info("No validation metrics available after filters.")
-    else:
-        st.info("No validation metrics available.")
-
-    st.subheader("Model Matrix & Ensemble Participation")
-    presence = []
-    for m in MODEL_SLOTS:
-        impl = forecaster.slot_info.get(m, {}).get("impl", "")
-        raw_status = forecaster.slot_info.get(m, {}).get("status", forecaster.model_status.get(m, "unknown"))
-        if raw_status == "unavailable_fallback_naive":
-            status_label = "Fallback: Seasonal Naive"
-        elif raw_status == "fallback":
-            status_label = "Fallback"
-        else:
-            status_label = raw_status
-        presence.append({
-            "Slot": m,
-            "Model": "SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m),
-            "Implementation": impl,
-            "Status": status_label,
-            "Available": raw_status != "unavailable",
-            "Used in Ensemble": bool(weights.get(m, 0.0) > 0),
-            "Weight": weights.get(m, 0.0),
-            "Val RMSE": val_results.get(m, {}).get("RMSE"),
-            "RJPP dev %": val_results.get(m, {}).get("RJPP_dev%"),
-            "Corr vs Ensemble": (
-                fc["Ensemble"].reindex(fc_raw.index).corr(fc_raw[m])
-                if m in fc_raw.columns and len(fc_raw) > 1
-                else np.nan
-            ),
-            "Error": model_errors.get(m, ""),
-            "_raw_status": raw_status,
-        })
-    model_matrix = pd.DataFrame(presence)
-    if "Error" in model_matrix.columns:
-        model_matrix["Error"] = model_matrix["Error"].replace({"": np.nan})
-    formatter = {"Val RMSE": "{:.2f}", "Corr vs Ensemble": "{:.2f}", "Weight": "{:.2f}"}
-    if has_rjpp and "RJPP dev %" in model_matrix.columns:
-        formatter["RJPP dev %"] = "{:.2f}"
-    elif "RJPP dev %" in model_matrix.columns:
-        model_matrix = model_matrix.drop(columns=["RJPP dev %"])
-    ordered_cols = ["Slot", "Implementation", "Status", "Available", "Used in Ensemble", "Weight", "Val RMSE"]
-    if has_rjpp and "RJPP dev %" in model_matrix.columns:
-        ordered_cols.append("RJPP dev %")
-    ordered_cols += ["Corr vs Ensemble", "Error"]
-    ordered_cols = [c for c in ordered_cols if c in model_matrix.columns]
-    st.dataframe(model_matrix[ordered_cols].style.format(formatter), use_container_width=True)
-
-    raw_status_series = model_matrix["_raw_status"] if "_raw_status" in model_matrix.columns else pd.Series(dtype=str)
-    fallback_naive_slots = model_matrix.loc[raw_status_series == "unavailable_fallback_naive", "Slot"].tolist()
-    if fallback_naive_slots:
-        names = ", ".join(fallback_naive_slots)
-        st.warning(
-            f"Seasonal naive fallback active for: {names}. Install LightGBM (`pip install lightgbm`) to unlock gradient boosting models.",
-            icon="⚠️",
-        )
-
-    optional_slots = ["Prophet", "LGB", "XGB"]
-    missing = [m for m in optional_slots if forecaster.slot_info.get(m, {}).get("status") == "unavailable"]
-    fallbacks = [m for m in optional_slots if forecaster.slot_info.get(m, {}).get("status", "").startswith("fallback")]
-    if missing:
-        install_map = {"Prophet": "prophet", "LGB": "lightgbm", "XGB": "xgboost"}
-        needed = sorted({install_map.get(m, m.lower()) for m in missing})
-        st.info(
-            "Optional models unavailable: " + ", ".join(missing) + f". Install with: `pip install {' '.join(needed)}`"
-        )
-    elif fallbacks:
-        labels = [forecaster.slot_info.get(m, {}).get("impl", m) for m in fallbacks]
-        st.caption("Fallback implementations in use: " + ", ".join(labels))
-
-    st.markdown("**Preview custom weighted ensemble (horizon)**")
-    available_weight_models = [m for m in MODEL_SLOTS if m in fc_raw.columns]
-    if available_weight_models:
-        cols = st.columns(len(available_weight_models)) if len(available_weight_models) <= 4 else None
-        custom_weights = {}
-        for idx, m in enumerate(available_weight_models):
-            impl = forecaster.slot_info.get(m, {}).get("impl", "")
-            label = impl if impl else ("SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m))
-            slider_args = {"label": label, "min_value": 0.0, "max_value": 1.0, "value": float(round(weights.get(m, 0.0), 2)), "key": f"w_{m}", "step": 0.05}
-            if cols:
-                with cols[idx]:
-                    custom_weights[m] = st.slider(**slider_args)
+        with st.expander("More KPIs", expanded=False):
+            if secondary_metrics:
+                for chunk_start in range(0, len(secondary_metrics), 3):
+                    cols_sec = st.columns(min(3, len(secondary_metrics) - chunk_start))
+                    for col, (label, value, delta) in zip(cols_sec, secondary_metrics[chunk_start:chunk_start + 3]):
+                        if delta is not None:
+                            show_metric(col, label, value, delta=delta, explain_on=explain_on)
+                        else:
+                            show_metric(col, label, value, explain_on=explain_on)
             else:
-                custom_weights[m] = st.slider(**slider_args)
-        if st.button("Preview reweighted ensemble", key="preview_reweight"):
-            total = sum(custom_weights.values())
-            if total <= 0:
-                st.warning("Assign at least one positive weight to preview the ensemble.")
-            else:
-                norm_weights = {m: w / total for m, w in custom_weights.items()}
-                ens = np.zeros(len(fc_raw.index))
-                for m, w in norm_weights.items():
-                    ens += w * np.nan_to_num(fc_raw[m].values)
-                fc_re = fc.copy()
-                if has_rjpp and "RJPP" in fc_re.columns:
-                    fc_re["Ensemble"] = np.clip(ens, fc_re["RJPP"] * (1 - forecaster.max_dev), fc_re["RJPP"] * (1 + forecaster.max_dev))
-                else:
-                    fc_re["Ensemble"] = np.maximum(0.0, ens)
-                st.caption("Weighted preview uses sliders above (normalized to 1.0).")
-                plot_hero(
-                    combined.to_frame("Combined"),
-                    fc_re,
-                    rjpp_full if has_rjpp else None,
-                    key_suffix="reweighted",
-                    show_bands=show_bands,
-                    bounded=bounded_bands,
-                    max_dev=forecaster.max_dev,
-                    forecast_start=forecast_start_ts,
+                st.caption("No secondary KPIs available.")
+
+        caption_bits = []
+        caption_bits.append(f"Ensemble selection: **{ensemble_choice}**")
+        if rjpp_has_reference and comp_rate is not None:
+            compliance_text = f"RJPP compliance base **{comp_display}**"
+            if comp_rate_adj is not None and np.isfinite(comp_rate_adj):
+                compliance_text += f" | scenario **{comp_display_adj}**"
+            caption_bits.append(compliance_text)
+        if rjpp_has_reference and clamped_months:
+            clamp_window = f"{first_clamp:%Y-%m} - {last_clamp:%Y-%m}" if first_clamp and last_clamp else "multiple months"
+            clamp_pct_display = _fmt_val(clamp_pct, "{:.1f}%")
+            caption_bits.append(f"Clamped months **{clamped_months}** (~{clamp_pct_display}) {clamp_window}")
+        if rjpp_has_reference and np.isfinite(worst_gap):
+            caption_bits.append(f"Worst annual gap **{_fmt_val(worst_gap, '{:.2f}%')}**")
+        st.caption("; ".join(caption_bits))
+
+        kpi_lines = [
+            "# Key KPIs",
+            f"- Next-12m Energy (GWh): {fmt_gwh(next_12_energy_gwh)}",
+            f"- Next-12m Avg (p50): {fmt_mw(next_12_avg)}",
+        ]
+        if rjpp_has_reference and comp_display is not None:
+            kpi_lines.append(f"- RJPP Compliance: {comp_display}")
+        elif has_rjpp:
+            kpi_lines.append("- RJPP Compliance: n/a (RJPP horizon exceeded)")
+        else:
+            kpi_lines.append("- RJPP Compliance: n/a")
+        clamp_pct_text = _fmt_val(clamp_pct, "{:.1f}%")
+        kpi_lines.append(f"- Clamped Months: {clamped_months} ({clamp_pct_text})")
+        kpi_lines.append(f"- Band Calibration (p10-90): {band_display}")
+        if ensemble_rmse is not None:
+            kpi_lines.append(f"- Validation RMSE: {ensemble_rmse:.2f}")
+        else:
+            kpi_lines.append("- Validation RMSE: n/a")
+        kpi_md = "\n".join(kpi_lines)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Copy KPIs"):
+                try:
+                    import importlib
+                    pyperclip = importlib.import_module("pyperclip")
+                    pyperclip.copy(kpi_md)
+                    st.success("KPIs copied to clipboard")
+                except Exception:
+                    st.info("KPIs available for download")
+                    st.download_button("Download KPIs (.md)", kpi_md, f"kpis_{datetime.now().strftime('%Y-%m-%d')}.md", "text/markdown")
+        with c2:
+            if st.button("Reset to defaults"):
+                for k in ["display_mode", "show_bands", "bounded_bands", "explain_mode"]:
+                    if k in st.session_state:
+                        st.session_state.pop(k, None)
+                st.experimental_rerun()
+
+        anchor_df = pd.DataFrame(anchor_rows).set_index("Year") if anchor_rows else pd.DataFrame()
+        if not annual_summary.empty or (has_rjpp and not anchor_df.empty):
+            st.subheader("Annual Summary & Health Checks")
+            col_summary, col_health = st.columns([2, 1])
+            if not annual_summary.empty:
+                col_summary.dataframe(
+                    annual_summary.reset_index().style.format({
+                        "Average_MW": "{:,.0f}",
+                        "Energy_GWh": "{:,.1f}",
+                        "Peak_MW": "{:,.0f}",
+                        "Load_Factor": "{:.3f}"
+                    }),
+                    use_container_width=True,
                 )
-    else:
-        st.caption("Trained model predictions are required to preview custom weights.")
-
-    with st.expander("Overlay selected model outputs (optional)", expanded=False):
-        st.caption("Overlay lets you visually compare chosen raw model outputs to the ensemble.")
-        available_models = [m for m in MODEL_SLOTS if m in fc_raw.columns]
-        if available_models:
-            default_overlay_slots: List[str] = []
-            if val_results:
-                val_df_sorted = pd.DataFrame(val_results).T
-                if "RMSE" in val_df_sorted.columns:
-                    val_df_sorted = val_df_sorted.sort_values("RMSE")
-                    val_df_sorted = val_df_sorted.loc[val_df_sorted.index != "Naive"]
-                    default_overlay_slots = [m for m in val_df_sorted.index if m in available_models][:2]
-            if not default_overlay_slots:
-                default_overlay_slots = available_models[:2]
-            overlay_labels = {}
-            for m in available_models:
-                base_label = forecaster.slot_info.get(m, {}).get("impl")
-                if not base_label:
-                    base_label = "SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m)
-                overlay_labels[m] = f"{base_label} [{m}]"
-            label_list = [overlay_labels[m] for m in available_models]
-            default_labels = [overlay_labels[m] for m in default_overlay_slots]
-            chosen_labels = st.multiselect("Overlay models", label_list, default=default_labels, key="overlay_pick")
-            chosen_slots = [m for m, lbl in overlay_labels.items() if lbl in chosen_labels]
-            if chosen_slots:
-                fig_overlay = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-                shade_start = fc.index.min() if len(fc.index) else None
-                if shade_start is not None:
-                    shaded(fig_overlay, shade_start, fc.index.max())
-                for m in chosen_slots:
-                    fig_overlay.add_trace(
-                        go.Scatter(
-                            x=fc_raw.index,
-                            y=fc_raw[m],
-                            name=overlay_labels[m],
-                            mode="lines",
-                            line=dict(width=1.8),
-                        )
-                    )
-                fig_overlay.add_trace(go.Scatter(x=fc.index, y=fc["Ensemble"], name="Ensemble", line=dict(width=3, color=PALETTE["ensemble"])))
-                if shade_start is not None:
-                    fig_overlay.add_vline(x=shade_start, line_width=1, line_dash="dot", line_color="orange")
-                fig_overlay.update_yaxes(ticksuffix=" MW", title_text="Load (MW)")
-                st.plotly_chart(fig_overlay, use_container_width=True, key="overlay_models")
-        else:
-            st.info("No trained model predictions available for overlay.")
-
-    with st.expander("Correlation heatmap (advanced)", expanded=False):
-        cols_for_corr = [c for c in MODEL_SLOTS if c in fc_raw.columns] + ["Ensemble"]
-        if len(cols_for_corr) >= 2:
-            st.caption("Correlation of model outputs across the forecast horizon.")
-            corr_heatmap(pd.concat([fc_raw[[c for c in cols_for_corr if c != "Ensemble"]], fc["Ensemble"]], axis=1), cols_for_corr)
-        else:
-            st.info("Need at least two model outputs to compute correlations.")
-
-    if "RF" in fc_raw.columns and "XGB" in fc_raw.columns:
-        common_idx = fc_raw.index
-        rf_aligned = fc_raw["RF"].reindex(common_idx)
-        xgb_aligned = fc_raw["XGB"].reindex(common_idx)
-        c = float(rf_aligned.corr(xgb_aligned)) if len(common_idx) > 1 else np.nan
-        if np.isfinite(c) and c >= 0.98:
-            st.warning(f"High similarity detected between RF and XGB (corr={c:.3f}). Check feature leakage or scaler reuse.")
-
-# ---------- Validation ----------
-with tab_validation:
-    st.subheader("MAE by Month")
-    mae_rendered = False
-    if (
-        ens_val_metrics
-        and ens_val_pred is not None
-        and val_df_for_bundle is not None
-        and val_index is not None
-        and "Average_Load" in val_df_for_bundle
-        and hasattr(ens_val_pred, "reindex")
-    ):
-        actual = val_df_for_bundle["Average_Load"].reindex(val_index)
-        forecast_err = (actual - ens_val_pred.reindex(val_index)).dropna()
-        if len(forecast_err):
-            mo = forecast_err.groupby(forecast_err.index.month).apply(lambda s: float(np.mean(np.abs(s))))
-            fig_mae = px.bar(mo, labels={"value": "MAE", "index": "Month"})
-            fig_mae.update_layout(PLOTLY_BASE_LAYOUT | {"title": "Monthly validation MAE"})
-            fig_mae.update_yaxes(ticksuffix=" MW")
-            st.plotly_chart(fig_mae, use_container_width=True, key="val_mae_moy_bar")
-            st.caption("Validation mean absolute error by calendar month (lower is better).")
-            mae_rendered = True
-    if not mae_rendered:
-        st.info("MAE by Month becomes available after running validation with holdout windows.")
-
-    if ens_val_metrics and ens_val_pred is not None:
-        naive_rmse_val = naive_metrics.get("RMSE") if naive_metrics else None
-        has_naive_rmse = naive_rmse_val is not None and np.isfinite(naive_rmse_val)
-        columns = st.columns(6) if has_naive_rmse else st.columns(5)
-        c1, c2, c3, c4, c5 = columns[:5]
-        show_metric(c1, "Ensemble RMSE", f"{ens_val_metrics['RMSE']:.2f}", explain_on=st.session_state.get("explain_mode", False))
-        show_metric(c2, "MAE", f"{ens_val_metrics['MAE']:.2f}", explain_on=st.session_state.get("explain_mode", False))
-        show_metric(c3, "MAPE", f"{ens_val_metrics['MAPE']:.2f}%", explain_on=st.session_state.get("explain_mode", False))
-        show_metric(c4, "WAPE", f"{ens_val_metrics['WAPE']:.2f}%", explain_on=st.session_state.get("explain_mode", False))
-        show_metric(c5, "sMAPE", f"{ens_val_metrics['sMAPE']:.2f}%", explain_on=st.session_state.get("explain_mode", False))
-        if has_naive_rmse:
-            delta_pct = ((naive_rmse_val - ens_val_metrics['RMSE']) / naive_rmse_val) * 100 if naive_rmse_val else np.nan
-            label = f"{delta_pct:+.1f}%" if np.isfinite(delta_pct) else "n/a"
-            show_metric(columns[5], "RMSE vs Naive", label, explain_on=st.session_state.get("explain_mode", False))
-
-        cal = calibration_pct
-        if cal is not None and np.isfinite(cal):
-            if 70 <= cal <= 90:
-                show_metric(st, "Calibration (p10-90 hit rate)", f"{cal:.1f}%", explain_on=st.session_state.get("explain_on", False))
-            elif 60 <= cal < 70 or 90 < cal <= 95:
-                st.markdown(f"<div style='color:#F59E0B;font-weight:600'>Calibration (p10-90): {cal:.1f}% - tune bands</div>", unsafe_allow_html=True)
+            if has_rjpp and not anchor_df.empty:
+                show_metric(col_health, "Worst Annual Gap", _fmt_val(worst_gap, "{:.2f}%"), explain_on=explain_on)
+                col_health.dataframe(anchor_df.style.format({"Gap_%": "{:.2f}"}), use_container_width=True)
             else:
-                st.markdown(f"<div style='color:#EF4444;font-weight:700'>Calibration (p10-90): {cal:.1f}% - revisit band construction</div>", unsafe_allow_html=True)
+                col_health.caption("No RJPP anchor diagnostics available.")
 
-    if val_bands is not None and not val_bands.empty and val_df_for_bundle is not None and "Average_Load" in val_df_for_bundle:
-        st.markdown("#### Band coverage by quarter")
-        plot_reliability(
-            val_df_for_bundle["Average_Load"].reindex(val_bands.index),
-            val_bands["p10"],
-            val_bands["p90"],
+    with tab_forecast:
+        st.subheader("Forecast")
+        plot_hero(
+            combined.to_frame("Combined"),
+            fc,
+            rjpp_full if has_rjpp else None,
+            key_suffix="forecast",
+            show_bands=show_bands,
+            bounded=bounded_bands,
+            max_dev=forecaster.max_dev,
+            fc_adj=fc_adj,
+            combined_adj=st.session_state.combined_adjusted,
+            planned_overlay=planned_overlay,
+            forecast_start=forecast_start_ts,
         )
+        with st.expander("ℹ Explain", expanded=False):
+            st.write(GLOSSARY.get("Band calibration (p10-90)") or "Forecast shows p50 with p10-90 uncertainty bands. Units: MW.")
 
-    # Add electrical engineering specific metrics
-    ensemble_val_metrics = results.get("ensemble_val_metrics", {})
-    if ensemble_val_metrics:
-        st.markdown("#### Electrical Engineering Metrics")
-        ee_cols = st.columns(4)
-        peak_error = ensemble_val_metrics.get("Peak_Error_MW")
-        dir_acc = ensemble_val_metrics.get("Directional_Accuracy_pct")
-        explain_flag = st.session_state.get("explain_mode", False)
-        
-        if peak_error is not None:
-            show_metric(ee_cols[0], "Peak Load Error", fmt_mw(peak_error), 
-                       explain_on=explain_flag)
-        if dir_acc is not None:
-            show_metric(ee_cols[1], "Directional Accuracy", fmt_pct(dir_acc),
-                       explain_on=explain_flag)
-        
-        # Monthly MAPE breakdown
-        monthly_mape = ensemble_val_metrics.get("monthly_mape", {})
-        if monthly_mape:
-            st.markdown("##### Seasonal Accuracy Breakdown")
-            st.caption("MAPE by month helps identify seasonal biases in forecasting.")
-            monthly_df = pd.DataFrame.from_dict(monthly_mape, orient='index', columns=['MAPE (%)']).sort_index()
-            fig_monthly = px.bar(monthly_df, y='MAPE (%)', 
-                               title="Monthly Forecast Accuracy (Lower is Better)")
-            fig_monthly.update_layout(PLOTLY_BASE_LAYOUT)
-            st.plotly_chart(fig_monthly, use_container_width=True, key="monthly_mape")
-    
-    with st.expander("Rolling Window Metrics (averaged)", expanded=False):
+        # Annual Delta Chart (Base vs Scenario-Adjusted)
+        if fc_adj is not None and len(fc.index):
+            base_col = "p50" if "p50" in fc.columns else "Ensemble"
+            adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else "Ensemble_adj"
+            if adj_col in fc_adj.columns:
+                st.subheader("Annual Impact: Scenario vs Base")
+            
+                # Calculate annual means
+                fc_annual = fc.groupby(fc.index.year)[base_col].mean()
+                fc_adj_annual = fc_adj.groupby(fc_adj.index.year)[adj_col].mean()
+            
+                annual_delta_mw = fc_adj_annual - fc_annual.reindex(fc_adj_annual.index)
+                annual_delta_pct = (annual_delta_mw / fc_annual.reindex(fc_adj_annual.index) * 100).replace([np.inf, -np.inf], np.nan)
+            
+                col1, col2 = st.columns(2)
+            
+                with col1:
+                    fig_delta_mw = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+                    colors = ['green' if x >= 0 else 'red' for x in annual_delta_mw.values]
+                    fig_delta_mw.add_trace(go.Bar(
+                        x=annual_delta_mw.index.astype(str),
+                        y=annual_delta_mw.values,
+                        marker_color=colors,
+                        name="Delta MW"
+                    ))
+                    fig_delta_mw.update_yaxes(title_text="Annual Average Delta (MW)")
+                    fig_delta_mw.update_layout(title_text="Scenario Impact (MW)")
+                    st.plotly_chart(fig_delta_mw, use_container_width=True, key="annual_delta_mw")
+            
+                with col2:
+                    fig_delta_pct = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+                    colors = ['green' if x >= 0 else 'red' for x in annual_delta_pct.dropna().values]
+                    fig_delta_pct.add_trace(go.Bar(
+                        x=annual_delta_pct.dropna().index.astype(str),
+                        y=annual_delta_pct.dropna().values,
+                        marker_color=colors,
+                        name="Delta %"
+                    ))
+                    fig_delta_pct.update_yaxes(title_text="Annual Average Delta (%)", ticksuffix=" %")
+                    fig_delta_pct.update_layout(title_text="Scenario Impact (%)")
+                    st.plotly_chart(fig_delta_pct, use_container_width=True, key="annual_delta_pct")
+
+        if has_rjpp and "Ensemble" in fc:
+            st.subheader("RJPP Deviation by Month (signed)")
+            dev = (fc["Ensemble"] - fc["RJPP"]) / fc["RJPP"] * 100
+            highlight_top = st.toggle("Show only worst deviations", value=False, key="rjpp_highlight_top")
+            plot_series = dev
+            title_suffix = ""
+            if highlight_top:
+                top_n = st.selectbox("Top N months", options=[6, 12, 24], index=0, key="rjpp_top_n")
+                selected_index = dev.abs().sort_values(ascending=False).index[:top_n]
+                plot_series = dev.loc[selected_index].sort_index()
+                title_suffix = f" (top {top_n})"
+            colors = [PALETTE["good"] if abs(v) <= forecaster.max_dev * 100 else (PALETTE["warn"] if abs(v) <= forecaster.max_dev * 150 else PALETTE["bad"]) for v in plot_series]
+            figd = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+            figd.add_trace(go.Bar(x=plot_series.index, y=plot_series.values, marker_color=colors, name="Deviation %"))
+            figd.add_hline(y=forecaster.max_dev*100, line_dash="dot", line_color="red", annotation_text="+/- max_dev")
+            figd.add_hline(y=-forecaster.max_dev*100, line_dash="dot", line_color="red")
+            figd.update_yaxes(ticksuffix=" %", title_text="Deviation (%)")
+            figd.update_layout(title_text=f"RJPP Deviation by Month{title_suffix}")
+            st.plotly_chart(figd, use_container_width=True, key="rjpp_dev_month_bar")
+            with st.expander("ℹ Explain", expanded=False):
+                st.write("Bars show monthly % deviation vs RJPP. Dotted lines are +/- bound. Colors: green within bound, amber near limit, red outside.")
+
+
+    # ---------- Models ----------
+    with tab_models:
+        st.subheader("Training controls")
+        prev_params = st.session_state.training_params.copy()
+        col_tc1, col_tc2, col_tc3, col_tc4 = st.columns(4)
+        val_months_sel = col_tc1.slider(
+            "Validation months",
+            min_value=6,
+            max_value=36,
+            value=int(prev_params.get("val_months", DEFAULT_VAL_MONTHS)),
+            step=1,
+        )
+        rolling_k_sel = col_tc2.slider(
+            "Rolling windows (K)",
+            min_value=1,
+            max_value=6,
+            value=int(prev_params.get("rolling_k", DEFAULT_ROLLING_K)),
+            step=1,
+        )
+        mom_quant_sel = col_tc3.slider(
+            "MoM cap quantile",
+            min_value=0.80,
+            max_value=0.98,
+            value=float(prev_params.get("mom_limit_quantile", 0.90)),
+            step=0.01,
+        )
+        max_dev_sel = col_tc4.slider(
+            "RJPP ± deviation",
+            min_value=0.01,
+            max_value=0.10,
+            value=float(prev_params.get("max_dev", DEFAULT_MAX_DEV)),
+            step=0.005,
+            format="%.3f",
+        )
+        st.session_state.training_params.update(
+            {
+                "val_months": int(val_months_sel),
+                "rolling_k": int(rolling_k_sel),
+                "mom_limit_quantile": float(round(mom_quant_sel, 2)),
+                "max_dev": float(round(max_dev_sel, 3)),
+            }
+        )
+        if st.session_state.training_params != prev_params:
+            st.session_state.training_params_dirty = True
+        if st.session_state.training_params_dirty:
+            st.info("Training settings changed. Re-run the forecast to apply updates.")
+
+        st.subheader("Per-Model Forecasts (horizon only)")
+        st.caption("Raw model outputs before RJPP alignment, noise, and clipping.")
+        plot_per_model(combined, fc, fc_raw, rjpp_full if has_rjpp else None, forecaster.slot_info)
+
+        metric_options = {"RMSE": "RMSE", "MAE": "MAE", "sMAPE": "sMAPE"}
+        st.session_state.setdefault("leaderboard_metric", "RMSE")
+        selected_metric_label = st.session_state.get("leaderboard_metric", "RMSE")
+        st.subheader(f"Model Leaderboard ({selected_metric_label})")
+        st.caption("Sorted ascending; lower values indicate better validation fit.")
+        with st.expander("More metrics", expanded=False):
+            st.markdown("Switch the leaderboard metric or review metric definitions.")
+            selected_metric_label = st.radio(
+                "Leaderboard metric",
+                list(metric_options.keys()),
+                index=list(metric_options.keys()).index(st.session_state.get("leaderboard_metric", "RMSE")),
+                key="leaderboard_metric",
+            )
+            gloss_lines = []
+            for label, column in metric_options.items():
+                gloss_key = _find_glossary_key(column)
+                desc = GLOSSARY.get(gloss_key) if gloss_key else None
+                if desc:
+                    gloss_lines.append(f"- **{label}**: {desc}")
+            if gloss_lines:
+                st.markdown("\n".join(gloss_lines))
+        metric_key = metric_options[st.session_state.get("leaderboard_metric", "RMSE")]
+        if has_rjpp and rjpp_proximity:
+            prox_df = pd.DataFrame(rjpp_proximity).T.rename(columns={"mean_signed_pct": "Mean signed %", "pct_within_5": "% within \u00b15%"})
+            st.caption("RJPP proximity diagnostics (raw model outputs)")
+            st.dataframe(prox_df.style.format({"Mean signed %": "{:.2f}%", "% within \u00b15%": "{:.1f}%"}), use_container_width=True)
         if val_results:
-            st.caption("Average validation metrics across rolling windows (lower is better).")
-            st.dataframe(pd.DataFrame(val_results).T.style.format("{:.3f}"), use_container_width=True)
+            show_baseline = st.checkbox("Show baseline (Naive) in leaderboard", value=False, key="show_baseline_leaderboard")
+            dfv = pd.DataFrame(val_results).T
+            if not show_baseline and "Naive" in dfv.index:
+                dfv = dfv.drop(index="Naive")
+            if not dfv.empty:
+                sort_metric = metric_key if metric_key in dfv.columns else "RMSE"
+                dfv = dfv.sort_values(sort_metric)
+                chart_df = dfv.head(5).reset_index()
+                y_axis = sort_metric
+                chart_df["Model"] = chart_df["index"].map(lambda name: forecaster.slot_info.get(name, {}).get("impl", name))
+                st.plotly_chart(
+                    px.bar(chart_df, x="Model", y=y_axis, labels={"Model": "Model", y_axis: y_axis}),
+                    use_container_width=True,
+                    key="model_leaderboard_bar",
+                )
+                impl_col = [forecaster.slot_info.get(idx, {}).get("impl", "") for idx in dfv.index]
+                dfv.insert(0, "Implementation", impl_col)
+                numeric_cols = dfv.select_dtypes(include=[np.number]).columns
+                st.dataframe(dfv.style.format({col: "{:.3f}" for col in numeric_cols}), use_container_width=True)
+            else:
+                st.info("No validation metrics available after filters.")
         else:
             st.info("No validation metrics available.")
 
-    with st.expander("Rolling metrics trend", expanded=False):
-        if validation_windows:
-            st.caption("Trend of validation errors over time; default metric is RMSE.")
-            metric_choice = st.selectbox("Metric", ["RMSE", "MAE", "MAPE", "WAPE", "sMAPE"], index=0, key="trend_metric")
-            available_models_trend = list(validation_windows.keys())
-            default_models = available_models_trend[:3] if len(available_models_trend) >= 3 else available_models_trend
-            selected_models_trend = st.multiselect("Models", available_models_trend, default=default_models, key="trend_models")
-            trend_frames = []
-            for m in selected_models_trend:
-                dfm = validation_windows.get(m)
-                if dfm is None or metric_choice not in dfm.columns:
-                    continue
-                temp = dfm.dropna(subset=["window_end", metric_choice]).copy()
-                if temp.empty:
-                    continue
-                label = forecaster.slot_info.get(m, {}).get("impl", None)
-                if not label:
-                    label = "SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m)
-                temp["Model"] = label
-                trend_frames.append(temp[["window_end", metric_choice, "Model"]])
-            if trend_frames:
-                trend_df = pd.concat(trend_frames).sort_values("window_end")
-                fig_trend = px.line(trend_df, x="window_end", y=metric_choice, color="Model")
-                fig_trend.update_layout(PLOTLY_BASE_LAYOUT)
-                fig_trend.update_traces(mode="lines+markers")
-                st.plotly_chart(fig_trend, use_container_width=True, key="val_trend")
+        st.subheader("Model Matrix & Ensemble Participation")
+        presence = []
+        for m in MODEL_SLOTS:
+            impl = forecaster.slot_info.get(m, {}).get("impl", "")
+            raw_status = forecaster.slot_info.get(m, {}).get("status", forecaster.model_status.get(m, "unknown"))
+            if raw_status == "unavailable_fallback_naive":
+                status_label = "Fallback: Seasonal Naive"
+            elif raw_status == "fallback":
+                status_label = "Fallback"
             else:
-                st.info("No rolling metrics available for the selected models.")
-        else:
-            st.info("Rolling window diagnostics will appear after validation is computed.")
-
-
-# ---------- Data Quality ----------
-with tab_quality:
-    dq_summary = getattr(forecaster, "data_quality_summary", {}) or {}
-    dq_cols = st.columns(4)
-    explain_flag = st.session_state.get("explain_mode", False)
-    show_metric(dq_cols[0], "Negative values", dq_summary.get("negatives", 0), explain_on=explain_flag)
-    show_metric(dq_cols[1], "Missing values", dq_summary.get("missing", 0), explain_on=explain_flag)
-    show_metric(dq_cols[2], "Duplicate dates", dq_summary.get("dupe_dates", 0), explain_on=explain_flag)
-    show_metric(dq_cols[3], "Near-zero entries", dq_summary.get("near_zero", 0), explain_on=explain_flag)
-    if dq_summary.get("negatives", 0):
-        st.warning(f"Detected {dq_summary['negatives']} negative load values; they were clipped during preprocessing.")
-    if dq_summary.get("dupe_dates", 0):
-        st.warning(f"Found {dq_summary['dupe_dates']} duplicated timestamps; consider deduplicating upstream.")
-    if dq_summary.get("near_zero", 0):
-        st.info(f"{dq_summary['near_zero']} entries are near zero (<1e-6 MW); double-check units.")
-    src = forecaster.load_df["Average_Load"]
-    missing_months_raw = dq_summary.get("missing_months", [])
-    missing_months_idx = pd.to_datetime(missing_months_raw) if missing_months_raw else pd.DatetimeIndex([])
-    missing_month_count = dq_summary.get("missing_month_count", len(missing_months_idx))
-    duplicate_ts = dq_summary.get("duplicate_timestamps", dq_summary.get("dupe_dates", 0))
-    outlier_points = dq_summary.get("outlier_points", []) or []
-    outlier_count = dq_summary.get("outlier_count", len(outlier_points))
-
-    a, b, c = st.columns(3)
-    show_metric(a, "Missing Months", missing_month_count, explain_on=explain_flag)
-    show_metric(b, "Duplicate Timestamps", duplicate_ts, explain_on=explain_flag)
-    show_metric(c, "Potential Outliers (|z|>3)", outlier_count, explain_on=explain_flag)
-
-    if missing_month_count:
-        st.warning(
-            f"Detected {missing_month_count} missing calendar month(s) within the historical window; "
-            "consider repairing gaps upstream."
-        )
-    if missing_months_idx.size:
-        missing_df = pd.DataFrame({"Date": missing_months_idx}).sort_values("Date")
-        st.write("Missing months:")
-        st.dataframe(missing_df.style.format({"Date": "{:%Y-%m}"}), use_container_width=True)
-        st.download_button("Download missing months", missing_df.to_csv(index=False), "missing_months.csv", "text/csv")
-    longest_gap = dq_summary.get("max_gap_segment", {}) or {}
-    gap_len = int(longest_gap.get("length", 0) or 0)
-    if gap_len > 1:
-        gap_start = pd.to_datetime(longest_gap.get("start"))
-        gap_end = pd.to_datetime(longest_gap.get("end"))
-        if pd.notna(gap_start) and pd.notna(gap_end):
-            st.info(f"Longest missing stretch spans {gap_len} months ({gap_start:%Y-%m} – {gap_end:%Y-%m}).")
-    gap_segment_count = dq_summary.get("gap_segment_count", 0)
-    if gap_segment_count > 1:
-        st.caption(f"Detected {gap_segment_count} distinct gap segments between first and last observation.")
-
-    if outlier_points:
-        out_df = pd.DataFrame(outlier_points)
-        out_df["Date"] = pd.to_datetime(out_df["Date"])
-        out_df = out_df.sort_values("Date")
-        st.write("Potential outliers (|z|>3):")
-        st.dataframe(out_df.style.format({"Date": "{:%Y-%m}", "z_score": "{:.2f}"}), use_container_width=True)
-        st.download_button(
-            "Download outliers",
-            out_df.to_csv(index=False),
-            "outliers.csv",
-            "text/csv",
-        )
-
-    freq = dq_summary.get("inferred_frequency")
-    if freq and freq != "MS":
-        st.warning(f"Inferred calendar frequency is '{freq}'; data was coerced to monthly start for modeling.")
-    if not dq_summary.get("index_monotonic", True):
-        st.warning("Historical index was not strictly increasing; records were sorted before training.")
-    first_obs = dq_summary.get("first_observation")
-    last_obs = dq_summary.get("last_observation")
-    if first_obs and last_obs:
-        st.caption(
-            f"Historical coverage: {pd.to_datetime(first_obs):%Y-%m} – {pd.to_datetime(last_obs):%Y-%m} "
-            f"({len(src)} monthly records)."
-        )
-
-    if has_rjpp:
-        fc_end = fc.index.max() if len(fc.index) else None
-        rjpp_end = rjpp_full.index.max() if rjpp_full is not None and len(rjpp_full.index) else None
-        if fc_end is not None and rjpp_end is not None and rjpp_end < fc_end:
-            st.warning(f"RJPP data ends at {rjpp_end:%Y-%m}; forecast extends to {fc_end:%Y-%m} (RJPP forward-filled).")
-        core_rjpp = getattr(forecaster, "rjpp", None)
-        if core_rjpp is not None and not core_rjpp.empty:
-            overlap_idx = forecaster.load_df.index.intersection(core_rjpp.index)
-            if len(overlap_idx):
-                load_mean = forecaster.load_df.loc[overlap_idx, "Average_Load"].mean()
-                rjpp_mean = core_rjpp.loc[overlap_idx, "RJPP"].mean()
-                if rjpp_mean and np.isfinite(load_mean) and np.isfinite(rjpp_mean):
-                    ratio = load_mean / rjpp_mean
-                    if np.isfinite(ratio) and (ratio < 0.1 or ratio > 10):
-                        st.warning(f"Historical load vs RJPP mean ratio ~{ratio:.2f}; check for unit mismatch (MW vs kW).")
-
-# ---------- Exports ----------
-with tab_exports:
-    st.subheader("Downloads")
-    base_col = "p50" if "p50" in fc.columns else "Ensemble"
-    minimal_out = pd.DataFrame(columns=["Date", "Forecast_MW"])
-    annual_energy_summary = pd.DataFrame()
-    if len(fc):
-        minimal_out = pd.DataFrame({"Date": fc.index, "Forecast_MW": fc[base_col].values})
-        if has_rjpp and "RJPP" in fc:
-            minimal_out["RJPP_MW"] = fc["RJPP"].values
-        hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float) * 24
-        energy_mwh = fc[base_col] * hours
-        annual_energy_summary = pd.DataFrame({
-            "Energy_GWh": energy_mwh.groupby(fc.index.year).sum() / 1000,
-            "Average_MW": fc[base_col].groupby(fc.index.year).mean(),
-            "Peak_MW": fc[base_col].groupby(fc.index.year).max(),
-        })
-        if not annual_energy_summary.empty:
-            annual_energy_summary["Load_Factor"] = annual_energy_summary["Average_MW"] / annual_energy_summary["Peak_MW"].replace(0, np.nan)
-            annual_energy_summary.index.name = "Year"
-    today = datetime.now().strftime("%Y-%m-%d")
-    st.download_button("Forecast CSV", fc.to_csv(), f"forecast_base_{today}.csv", "text/csv")
-    st.download_button("Combined CSV", combined.to_csv(), f"combined_{today}.csv", "text/csv")
-    if has_rjpp and rjpp_full is not None:
-        st.download_button("RJPP CSV", rjpp_full.to_csv(), "rjpp_full.csv", "text/csv")
-    if not minimal_out.empty:
-        st.download_button("Minimal Forecast CSV", minimal_out.to_csv(index=False), "forecast_minimal.csv", "text/csv")
-    if not annual_energy_summary.empty:
-        st.download_button("Annual Energy Summary CSV", annual_energy_summary.reset_index().to_csv(index=False), "annual_energy_summary.csv", "text/csv")
-    
-    # Scenario-related exports
-    scenarios_json = json.dumps(st.session_state.scenarios, indent=2, ensure_ascii=False) if st.session_state.get("scenarios") else "[]"
-    st.download_button("Scenarios JSON", scenarios_json, f"scenarios_{today}.json", "application/json")
-    
-    if fc_adj is not None:
-        adj_cols = [col for col in fc_adj.columns if col.endswith('_adj')]
-        if adj_cols:
-            st.download_button("Forecast Adjusted CSV", fc_adj[adj_cols].to_csv(), f"forecast_adjusted_{today}.csv", "text/csv")
-    
-    # Delta comparison export
-    if fc_adj is not None and "Ensemble" in fc.columns:
-        base_col = "p50" if "p50" in fc.columns else "Ensemble"
-        adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else "Ensemble_adj"
-        if adj_col in fc_adj.columns:
-            delta_df = pd.DataFrame({
-                "Date": fc.index,
-                "Base_MW": fc[base_col].values,
-                "Adjusted_MW": fc_adj[adj_col].values,
-                "Delta_MW": (fc_adj[adj_col] - fc[base_col]).values,
-                "Delta_Pct": ((fc_adj[adj_col] - fc[base_col]) / fc[base_col] * 100).replace([np.inf, -np.inf], np.nan).values
+                status_label = raw_status
+            presence.append({
+                "Slot": m,
+                "Model": "SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m),
+                "Implementation": impl,
+                "Status": status_label,
+                "Available": raw_status != "unavailable",
+                "Used in Ensemble": bool(weights.get(m, 0.0) > 0),
+                "Weight": weights.get(m, 0.0),
+                "Val RMSE": val_results.get(m, {}).get("RMSE"),
+                "RJPP dev %": val_results.get(m, {}).get("RJPP_dev%"),
+                "Corr vs Ensemble": (
+                    fc["Ensemble"].reindex(fc_raw.index).corr(fc_raw[m])
+                    if m in fc_raw.columns and len(fc_raw) > 1
+                    else np.nan
+                ),
+                "Error": model_errors.get(m, ""),
+                "_raw_status": raw_status,
             })
-            
-            # Add annual summary
-            delta_annual = pd.DataFrame({
-                "Year": fc.index.year,
-                "Base_MW": fc[base_col].values,
-                "Adjusted_MW": fc_adj[adj_col].values,
-                "Delta_MW": (fc_adj[adj_col] - fc[base_col]).values
-            }).groupby("Year").agg({
-                "Base_MW": "mean",
-                "Adjusted_MW": "mean", 
-                "Delta_MW": "mean"
-            })
-            delta_annual["Delta_Pct"] = (delta_annual["Delta_MW"] / delta_annual["Base_MW"] * 100).replace([np.inf, -np.inf], np.nan)
-            
-            st.download_button("Delta Base vs Adjusted (Monthly) CSV", delta_df.to_csv(index=False), f"scenario_A_vs_B_{today}_monthly.csv", "text/csv")
-            st.download_button("Delta Base vs Adjusted (Annual) CSV", delta_annual.reset_index().to_csv(index=False), f"scenario_A_vs_B_{today}_annual.csv", "text/csv")
+        model_matrix = pd.DataFrame(presence)
+        if "Error" in model_matrix.columns:
+            model_matrix["Error"] = model_matrix["Error"].replace({"": np.nan})
+        formatter = {"Val RMSE": "{:.2f}", "Corr vs Ensemble": "{:.2f}", "Weight": "{:.2f}"}
+        if has_rjpp and "RJPP dev %" in model_matrix.columns:
+            formatter["RJPP dev %"] = "{:.2f}"
+        elif "RJPP dev %" in model_matrix.columns:
+            model_matrix = model_matrix.drop(columns=["RJPP dev %"])
+        ordered_cols = ["Slot", "Implementation", "Status", "Available", "Used in Ensemble", "Weight", "Val RMSE"]
+        if has_rjpp and "RJPP dev %" in model_matrix.columns:
+            ordered_cols.append("RJPP dev %")
+        ordered_cols += ["Corr vs Ensemble", "Error"]
+        ordered_cols = [c for c in ordered_cols if c in model_matrix.columns]
+        st.dataframe(model_matrix[ordered_cols].style.format(formatter), use_container_width=True)
 
-    clamp_mask = None
-    clamped_months = 0
-    clamp_pct = np.nan
-    if has_rjpp and "RJPP" in fc:
-        lo = fc["RJPP"] * (1 - forecaster.max_dev)
-        hi = fc["RJPP"] * (1 + forecaster.max_dev)
-        tol = np.maximum(fc["RJPP"].abs() * 0.002, 0.5)
-        clamp_mask = ((fc["Ensemble"] - lo).abs() <= tol) | ((fc["Ensemble"] - hi).abs() <= tol)
-        clamped_months = int(clamp_mask.sum())
-        clamp_pct = float(clamp_mask.mean() * 100) if len(clamp_mask) else np.nan
+        raw_status_series = model_matrix["_raw_status"] if "_raw_status" in model_matrix.columns else pd.Series(dtype=str)
+        fallback_naive_slots = model_matrix.loc[raw_status_series == "unavailable_fallback_naive", "Slot"].tolist()
+        if fallback_naive_slots:
+            names = ", ".join(fallback_naive_slots)
+            st.warning(
+                f"Seasonal naive fallback active for: {names}. Install LightGBM (`pip install lightgbm`) to unlock gradient boosting models.",
+                icon="⚠️",
+            )
 
-    qa_bytes = io.BytesIO()
-    with zipfile.ZipFile(qa_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("forecast.csv", fc.to_csv())
-        zf.writestr("forecast_raw_before_align_noise_clip.csv", fc_raw.to_csv())
-        zf.writestr("combined.csv", combined.to_csv())
-        if not minimal_out.empty:
-            zf.writestr("forecast_minimal.csv", minimal_out.to_csv(index=False))
-        if not annual_energy_summary.empty:
-            zf.writestr("annual_energy_summary.csv", annual_energy_summary.reset_index().to_csv(index=False))
-        tmp = fc.copy(); tmp["Year"] = tmp.index.year
-        cols = [c for c in ["Ensemble", "p10", "p50", "p90"] if c in tmp.columns]
-        annual = tmp.groupby("Year")[cols].mean()
-        annual["YoY_%"] = annual[( "p50" if "p50" in annual.columns else "Ensemble")].pct_change()*100
-        zf.writestr("yearly_means_p10_p50_p90.csv", annual.to_csv())
-        if val_results:
-            zf.writestr("validation_metrics_averaged.csv", pd.DataFrame(val_results).T.to_csv())
-        if ens_val_metrics and ens_val_pred is not None and val_df_for_bundle is not None and results.get("val_index") is not None:
-            val_idx = results["val_index"]
-            val_df_out = pd.DataFrame(index=val_idx)
-            val_df_out["Actual"] = val_df_for_bundle["Average_Load"].reindex(val_idx)
-            for m, arr in forecaster.val_preds.items():
-                s = pd.Series(arr); val_df_out[m] = s.reindex(val_idx)
-            val_df_out["Ensemble_val"] = ens_val_pred.reindex(val_idx)
-            zf.writestr("validation_window_preds.csv", val_df_out.to_csv())
-        if validation_windows:
-            frames = []
-            for name, dfm in validation_windows.items():
-                df_local = dfm.copy()
-                df_local["Model"] = name
-                frames.append(df_local)
-            if frames:
-                vw_df = pd.concat(frames)
-                zf.writestr("validation_windows_metrics.csv", vw_df.to_csv(index=False))
-        models_used = {
-            slot: {
-                "implementation": forecaster.slot_info.get(slot, {}).get("impl", ""),
-                "status": forecaster.slot_info.get(slot, {}).get("status", forecaster.model_status.get(slot, "unknown")),
-                "weight": float(weights.get(slot, 0.0))
-            }
-            for slot in MODEL_SLOTS
-        }
-        zf.writestr("models_used.json", json.dumps(models_used, indent=2))
-        if has_rjpp and "RJPP" in fc:
-            dev = (fc["Ensemble"] - fc["RJPP"]) / fc["RJPP"] * 100
-            zf.writestr("rjpp_monthly_deviation.csv", pd.DataFrame({"Date": dev.index, "dev%": dev.values, "abs_dev%": dev.abs().values}).to_csv(index=False))
-        calibration_display = f"{calibration_pct:.1f}%" if calibration_pct is not None and np.isfinite(calibration_pct) else "n/a"
-        clamp_line = "n/a" if not has_rjpp else (f"{clamped_months}/{len(fc)} ({clamp_pct:.1f}%)" if len(fc) else "0")
-        settings = f"""Run Settings:
-- Forecast: {_month_start(forecast_start):%b %Y} -> {_month_start(forecast_end):%b %Y}
-- Ensemble method: {ensemble_choice} (auto-selected from PRESETS)
-- Annual anchor tolerance: ±{PRESETS['annual_anchor_tolerance']*100:.1f}%
-- Horizon-aware caps: h1-3={PRESETS['horizon_max_dev']['h1_3']*100:.0f}%, h4-6={PRESETS['horizon_max_dev']['h4_6']*100:.0f}%, h7-12={PRESETS['horizon_max_dev']['h7_12']*100:.0f}%, h13+={PRESETS['horizon_max_dev']['h13p']*100:.0f}%
-- MoM caps (horizon-aware): h1-12={PRESETS['mom_cap']['h1_12']*100:.0f}%, h13+={PRESETS['mom_cap']['h13p']*100:.0f}%
-- Residual noise: {"On" if forecaster.add_noise else "Off"} (scale={forecaster.noise_scale:.2f})
-- Use RJPP: {"Yes" if forecaster.use_rjpp else "No"}
-- Residualize (effective): {"Yes" if getattr(forecaster, '_residualize_effective', False) else "No"}
-- Seasonal strength: {getattr(forecaster, 'seasonal_strength', 0.0):.3f}
-- Guard scope: {forecaster.apply_guards_to}
-- Smoothing alpha: {PRESETS['smoothing_alpha']:.2f} (disabled)
-- Calibration (p10-90 target): {PRESETS['band_target_coverage']*100:.0f}%
-- Calibration (actual): {calibration_display}
-- Band calibration k: {forecaster.band_k:.3f}
-- Validation RMSE (weighted): {getattr(forecaster, 'val_rmse_weighted', np.nan):.2f}
-- Validation RMSE (meta): {getattr(forecaster, 'val_rmse_meta', np.nan):.2f}
-- Models available: {", ".join([m for m,s in model_status.items() if s=="ok"])}
-- Models unavailable: {", ".join([m for m,s in model_status.items() if s!="ok"])}
-- Python: {sys.version.split()[0]}
-- numpy: {np.__version__}; pandas: {pd.__version__}; plotly: {plotly.__version__}; statsmodels: {sm.__version__}; sklearn: {sklearn_version}
-"""
-        zf.writestr("settings.txt", settings)
-    st.download_button("QA bundle (.zip)", qa_bytes.getvalue(), f"qa_bundle_{today}.zip", "application/zip")
+        optional_slots = ["Prophet", "LGB", "XGB"]
+        missing = [m for m in optional_slots if forecaster.slot_info.get(m, {}).get("status") == "unavailable"]
+        fallbacks = [m for m in optional_slots if forecaster.slot_info.get(m, {}).get("status", "").startswith("fallback")]
+        if missing:
+            install_map = {"Prophet": "prophet", "LGB": "lightgbm", "XGB": "xgboost"}
+            needed = sorted({install_map.get(m, m.lower()) for m in missing})
+            st.info(
+                "Optional models unavailable: " + ", ".join(missing) + f". Install with: `pip install {' '.join(needed)}`"
+            )
+        elif fallbacks:
+            labels = [forecaster.slot_info.get(m, {}).get("impl", m) for m in fallbacks]
+            st.caption("Fallback implementations in use: " + ", ".join(labels))
 
-    if has_rjpp and "RJPP" in fc and "Ensemble" in fc:
-        st.subheader("Annual Re-anchor Check (target <=1.0%)")
-        rows=[]
-        for y in sorted(fc.index.year.unique()):
-            mask = fc.index.year==y
-            yr_mean = fc.loc[mask,"Ensemble"].mean()
-            dec_val = fc.loc[fc.index==pd.Timestamp(y,12,1),"RJPP"]
-            if len(dec_val):
-                rjpp_dec = float(dec_val.values[0])
-                gap = abs((yr_mean - rjpp_dec)/rjpp_dec)*100 if rjpp_dec else np.nan
-                status = "Pass" if gap <= 1.0 else ("Watch" if gap <= 1.5 else "Fail")
-                rows.append({"Year":y,"Gap_%":gap,"Status":status})
-        if rows:
-            df_anchor = pd.DataFrame(rows)
-            st.dataframe(df_anchor.style.format({"Gap_%":"{:.2f}"}), use_container_width=True)
-
-    if ui_log_handler.buffer:
-        st.subheader("Pipeline Logs")
-        st.code("\n".join(ui_log_handler.buffer[-200:]), language="text")
-
-# ---------- Scenarios tab (consolidated builder, manager, compare) ----------
-#############################
-# Redesigned Scenario Tab   #
-#############################
-
-# --- Helper: Month utilities for new UI ---
-def _ym_to_first_of_month(year: int, month: int) -> str:
-    return f"{year:04d}-{month:02d}-01"
-
-def _parse_month(s: str) -> pd.Timestamp:
-    return pd.to_datetime(s).to_period("M").to_timestamp()
-
-def validate_scenario_dict(d: dict) -> list[str]:
-    errors = []
-    if not d.get("name"):
-        errors.append("Name is required.")
-    # Accept either capacity_mw or mw
-    capacity = d.get("capacity_mw") or d.get("mw", 0)
-    if capacity <= 0:
-        errors.append("Capacity must be > 0.")
-    profile = d.get("profile")
-    start = d.get("start_month")
-    peak = d.get("peak_month")
-    plateau = d.get("plateau_end")
-    retire = d.get("retire_month")
-    def _to_ts(x):
-        return pd.to_datetime(x).to_period("M").to_timestamp() if x else None
-    ts_start, ts_peak, ts_plateau, ts_retire = map(_to_ts, [start, peak, plateau, retire])
-    if profile in ("ramp", "s_curve") and not peak:
-        errors.append("Peak month required for Ramp / S-curve.")
-    ordering = [(ts_start, "Start"), (ts_peak, "Peak"), (ts_plateau, "PlateauEnd"), (ts_retire, "Retire")]
-    prev = None
-    for ts, label in ordering:
-        if ts is None:
-            continue
-        if prev and ts < prev:
-            errors.append(f"Month ordering invalid: {label} before previous milestone.")
-        prev = ts
-    if profile == "custom_csv":
-        if not d.get("_uploaded_valid", False):
-            errors.append("Custom CSV not uploaded or invalid.")
-    return errors
-
-@st.cache_data(show_spinner=False)
-def _hash_scenario_for_cache(d: dict) -> str:
-    keys = [k for k in d.keys() if not k.startswith("_") and k not in ("active", "priority")]
-    blob = json.dumps({k: d.get(k) for k in sorted(keys)}, sort_keys=True)
-    return hashlib.md5(blob.encode()).hexdigest()
-
-def _index_signature(index: pd.DatetimeIndex | None) -> str:
-    """Return a compact, hashable signature describing a DatetimeIndex."""
-    try:
-        if index is None or len(index) == 0:
-            return "0:None:None:None"
-        first = pd.to_datetime(index[0]).strftime('%Y-%m-%d')
-        last = pd.to_datetime(index[-1]).strftime('%Y-%m-%d')
-        # freqstr may be None for irregular indexes
-        freq = getattr(index, 'freqstr', None) or (str(getattr(index, 'freq', None)) if getattr(index, 'freq', None) else 'None')
-        return f"{len(index)}:{first}:{last}:{freq}"
-    except Exception:
-        # As a last resort, use md5 of the stringified values (avoid huge keys)
-        try:
-            vals = ",".join(pd.to_datetime(index).strftime('%Y-%m-%d').tolist()) if index is not None else ""
-            return hashlib.md5(vals.encode()).hexdigest()
-        except Exception:
-            return "unknown_index"
-
-@st.cache_data(show_spinner=False)
-def build_scenario_series(d: dict, _index: pd.DatetimeIndex, index_sig: str) -> pd.Series:
-    """Return a monthly MW series for the scenario aligned to index."""
-    profile = d.get("profile")
-    cap = float(d.get("capacity_mw", 0.0) or 0.0)
-    start = d.get("start_month")
-    peak = d.get("peak_month")
-    plateau = d.get("plateau_end")
-    retire = d.get("retire_month")
-    if profile == "step":
-        # Use existing step implementation logic (reuse scenario_engine if possible)
-        from scenario_engine import step_profile
-        return step_profile(cap, _index, start, retire)
-    elif profile == "ramp":
-        from scenario_engine import ramp_profile
-        return ramp_profile(cap, _index, start, peak, plateau, retire)
-    elif profile == "s_curve":
-        from scenario_engine import s_curve_profile
-        if not peak:
-            return pd.Series(0.0, index=_index)
-        return s_curve_profile(cap, _index, start, peak)
-    elif profile == "custom_csv":
-        path = d.get("_custom_csv_path")
-        if not path:
-            return pd.Series(0.0, index=_index)
-        try:
-            df = pd.read_csv(path)
-            if not {"month", "mw"}.issubset({c.lower() for c in df.columns}):
-                return pd.Series(0.0, index=_index)
-            # Normalize column names
-            col_map = {c: c.lower() for c in df.columns}
-            df.columns = [c.lower() for c in df.columns]
-            df["month"] = pd.to_datetime(df["month"]).dt.to_period("M").dt.to_timestamp()
-            monthly = df.set_index("month")["mw"].astype(float).reindex(_index).fillna(0.0)
-            # Enforce non-negative
-            return monthly.clip(lower=0.0)
-        except Exception:
-            return pd.Series(0.0, index=_index)
-    else:
-        return pd.Series(0.0, index=_index)
-
-def compute_planned_components(scenarios: list[dict], index: pd.DatetimeIndex) -> dict[str, pd.Series]:
-    active = [s for s in scenarios if s.get("active", True)]
-    # Normalize priority: existing integer or fallback to list order
-    for i, s in enumerate(active):
-        if "priority" not in s or s["priority"] is None or not isinstance(s["priority"], int):
-            s["priority"] = i
-    ordered = sorted(active, key=lambda x: x.get("priority", 0))
-    comp = {}
-    idx_sig = _index_signature(index)
-    for scn in ordered:
-        series = build_scenario_series(scn, index, idx_sig)
-        comp[scn["name"]] = series
-    return comp
-
-def sum_components(components: dict[str, pd.Series]) -> pd.Series:
-    if not components:
-        return pd.Series(dtype=float)
-    total = None
-    for s in components.values():
-        if total is None:
-            total = s.astype(float)
-        else:
-            total = total.add(s.astype(float), fill_value=0.0)
-    return total.clip(lower=0.0) if total is not None else pd.Series(dtype=float)
-
-def plot_stacked_overlay(components: dict[str, pd.Series], base_df: pd.DataFrame, adjusted_df: pd.DataFrame | None) -> go.Figure:
-    fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-    # Stacked components
-    for name, series in components.items():
-        fig.add_trace(go.Scatter(x=series.index, y=series.values, name=name, mode="lines", stackgroup="scn", line=dict(width=1)))
-    base_col = "p50" if "p50" in base_df.columns else "Ensemble"
-    fig.add_trace(go.Scatter(x=base_df.index, y=base_df[base_col], name="Base p50", mode="lines", line=dict(width=2, dash="dot", color="#555")))
-    if adjusted_df is not None:
-        adj_col = "p50_adj" if "p50_adj" in adjusted_df.columns else ("Ensemble_adj" if "Ensemble_adj" in adjusted_df.columns else None)
-        if adj_col:
-            fig.add_trace(go.Scatter(x=adjusted_df.index, y=adjusted_df[adj_col], name="Adjusted p50", mode="lines", line=dict(width=3, color=PALETTE.get("scenario", "#D97706"))))
-    fig.update_yaxes(title_text="MW", ticksuffix=" MW", rangemode="tozero")
-    fig.update_layout(title="Stacked Scenario Overlay")
-    return fig
-
-def plot_annual_impact(adjusted_df: pd.DataFrame, base_df: pd.DataFrame) -> go.Figure:
-    base_col = "p50" if "p50" in base_df.columns else "Ensemble"
-    adj_col = "p50_adj" if "p50_adj" in adjusted_df.columns else ("Ensemble_adj" if "Ensemble_adj" in adjusted_df.columns else None)
-    fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-    if adj_col is None:
-        return fig
-    b = base_df[base_col].groupby(base_df.index.year).mean()
-    a = adjusted_df[adj_col].groupby(adjusted_df.index.year).mean()
-    years = sorted(set(b.index).union(a.index))
-    delta_mw = []
-    for y in years:
-        bv = b.get(y, np.nan)
-        av = a.get(y, np.nan)
-        delta_mw.append(av - bv if (np.isfinite(av) and np.isfinite(bv)) else np.nan)
-    fig.add_trace(go.Bar(x=[str(y) for y in years], y=delta_mw, name="ΔMW", marker_color=["green" if (v or 0) >=0 else "red" for v in delta_mw]))
-    fig.update_yaxes(title_text="Δ Avg MW")
-    fig.update_layout(title="Annual Impact (Adjusted - Base)")
-    return fig
-
-def compute_kpis(base_df: pd.DataFrame, adjusted_df: pd.DataFrame | None, rjpp_df: pd.DataFrame | None) -> dict:
-    base_col = "p50" if "p50" in base_df.columns else "Ensemble"
-    adj_col = None
-    if adjusted_df is not None:
-        adj_col = "p50_adj" if "p50_adj" in adjusted_df.columns else ("Ensemble_adj" if "Ensemble_adj" in adjusted_df.columns else None)
-    out = {}
-    base_peak = base_df[base_col].max() if len(base_df) else np.nan
-    base_peak_month = base_df[base_col].idxmax() if len(base_df) else None
-    out["base_peak_mw"] = float(base_peak) if np.isfinite(base_peak) else np.nan
-    out["base_peak_month"] = base_peak_month
-    if adj_col:
-        adj_peak = adjusted_df[adj_col].max()
-        adj_peak_month = adjusted_df[adj_col].idxmax()
-    else:
-        adj_peak = np.nan; adj_peak_month = None
-    out["delta_peak_mw"] = (adj_peak - base_peak) if np.isfinite(adj_peak) and np.isfinite(base_peak) else np.nan
-    out["delta_peak_month"] = adj_peak_month
-    # Average next 12 months
-    def _avg12(df, col):
-        if df is None or col is None or col not in df.columns or df.empty:
-            return np.nan
-        return float(df[col].iloc[:12].mean()) if len(df) >= 1 else np.nan
-    base_avg12 = _avg12(base_df, base_col)
-    adj_avg12 = _avg12(adjusted_df, adj_col) if adj_col else np.nan
-    out["delta_avg_mw"] = (adj_avg12 - base_avg12) if np.isfinite(base_avg12) and np.isfinite(adj_avg12) else np.nan
-    out["delta_avg_pct"] = ((adj_avg12 / base_avg12) - 1) * 100 if np.isfinite(base_avg12) and base_avg12>0 and np.isfinite(adj_avg12) else np.nan
-    # RJPP compliance simple calc
-    def _compliance(df, col):
-        if df is None or col is None or "RJPP" not in df.columns:
-            return np.nan
-        series = (df[col] - df["RJPP"]).abs() / df["RJPP"].replace(0, np.nan)
-        return float((series <= getattr(st.session_state.forecaster, 'max_dev', 0.05)).mean()*100)
-    if rjpp_df is not None:
-        base_tmp = base_df.copy(); base_tmp["RJPP"] = rjpp_df["RJPP"].reindex(base_df.index)
-        out["rjpp_base_pct"] = _compliance(base_tmp, base_col)
-        if adj_col and adjusted_df is not None:
-            adj_tmp = adjusted_df.copy(); adj_tmp["RJPP"] = rjpp_df["RJPP"].reindex(adjusted_df.index)
-            out["rjpp_adj_pct"] = _compliance(adj_tmp, adj_col)
-            if np.isfinite(out.get("rjpp_base_pct", np.nan)) and np.isfinite(out.get("rjpp_adj_pct", np.nan)):
-                out["rjpp_delta_pp"] = out["rjpp_adj_pct"] - out["rjpp_base_pct"]
-            else:
-                out["rjpp_delta_pp"] = np.nan
-        else:
-            out["rjpp_adj_pct"] = np.nan; out["rjpp_delta_pp"] = np.nan
-    else:
-        out.update({"rjpp_base_pct": np.nan, "rjpp_adj_pct": np.nan, "rjpp_delta_pp": np.nan})
-    # Placeholder clamped metrics (reuse if base_df already has them calculated externally)
-    out["clamped_months_base"] = np.nan
-    out["clamped_months_adj"] = np.nan
-    out["worst_anchor_gap_category"] = None
-    return out
-
-def ui_quick_planner_form():
-    st.markdown("#### Quick Planner")
-    with st.container(border=True):
-        colA, colB = st.columns([1,1])
-        with colA:
-            name = st.text_input("Name", key="qp_name", help="Unique scenario name.")
-        with colB:
-            capacity = st.number_input("Capacity (MW)", min_value=0.0, value=0.0, step=10.0, key="qp_cap", help="Peak incremental load contribution in MW.")
-        # Start month pickers
-        now_year = datetime.now().year
-        years = list(range(now_year, now_year+20))
-        colY, colM = st.columns([1,1])
-        with colY:
-            start_year = st.selectbox("Start year", years, index=0, key="qp_start_year")
-        with colM:
-            start_month = st.selectbox("Start month", list(range(1,13)), index=0, key="qp_start_month")
-        start_month_str = _ym_to_first_of_month(start_year, start_month)
-        profile = st.selectbox("Profile type", ["Step","Ramp","S-curve","Custom CSV"], key="qp_profile", help="Shape of build-up over time.")
-        # Conditional fields
-        peak_month = plateau_end = retire_month = None
-        if profile in ("Ramp", "S-curve"):
-            col1, col2 = st.columns([1,1])
-            with col1:
-                peak_year = st.selectbox("Peak year", years, index=min(1, len(years)-1), key="qp_peak_year", help="Month when full capacity is first reached.")
-            with col2:
-                peak_m = st.selectbox("Peak month", list(range(1,13)), index=5, key="qp_peak_month")
-            peak_month = _ym_to_first_of_month(peak_year, peak_m)
-            colp1, colp2 = st.columns([1,1])
-            with colp1:
-                plateau_flag = st.checkbox("Plateau end?", value=False, key="qp_plateau_flag")
-            if plateau_flag:
-                with colp2:
-                    plateau_year = st.selectbox("Plateau end year", years, index=min(2,len(years)-1), key="qp_plateau_year")
-                plateau_m = st.selectbox("Plateau end month", list(range(1,13)), index=0, key="qp_plateau_month")
-                plateau_end = _ym_to_first_of_month(st.session_state.qp_plateau_year, plateau_m)
-            retire_flag = st.checkbox("Retire?", value=False, key="qp_retire_flag")
-            if retire_flag:
-                retire_year = st.selectbox("Retire year", years, index=min(3,len(years)-1), key="qp_retire_year")
-                retire_m = st.selectbox("Retire month", list(range(1,13)), index=0, key="qp_retire_month")
-                retire_month = _ym_to_first_of_month(retire_year, retire_m)
-        uploaded_path = None
-        upload_valid = False
-        if profile == "Custom CSV":
-            csv_file = st.file_uploader("Upload custom CSV", type=["csv"], key="qp_upload", help="Columns: month (YYYY-MM-01), mw (float).")
-            if csv_file is not None:
-                try:
-                    tmp_path = _save_file(csv_file, "custom_scn_")
-                    df = pd.read_csv(tmp_path)
-                    if {"month", "mw"}.issubset({c.lower() for c in df.columns}):
-                        uploaded_path = tmp_path
-                        upload_valid = True
+        st.markdown("**Preview custom weighted ensemble (horizon)**")
+        available_weight_models = [m for m in MODEL_SLOTS if m in fc_raw.columns]
+        if available_weight_models:
+            cols = st.columns(len(available_weight_models)) if len(available_weight_models) <= 4 else None
+            custom_weights = {}
+            for idx, m in enumerate(available_weight_models):
+                impl = forecaster.slot_info.get(m, {}).get("impl", "")
+                label = impl if impl else ("SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m))
+                slider_args = {"label": label, "min_value": 0.0, "max_value": 1.0, "value": float(round(weights.get(m, 0.0), 2)), "key": f"w_{m}", "step": 0.05}
+                if cols:
+                    with cols[idx]:
+                        custom_weights[m] = st.slider(**slider_args)
+                else:
+                    custom_weights[m] = st.slider(**slider_args)
+            if st.button("Preview reweighted ensemble", key="preview_reweight"):
+                total = sum(custom_weights.values())
+                if total <= 0:
+                    st.warning("Assign at least one positive weight to preview the ensemble.")
+                else:
+                    norm_weights = {m: w / total for m, w in custom_weights.items()}
+                    ens = np.zeros(len(fc_raw.index))
+                    for m, w in norm_weights.items():
+                        ens += w * np.nan_to_num(fc_raw[m].values)
+                    fc_re = fc.copy()
+                    if has_rjpp and "RJPP" in fc_re.columns:
+                        fc_re["Ensemble"] = np.clip(ens, fc_re["RJPP"] * (1 - forecaster.max_dev), fc_re["RJPP"] * (1 + forecaster.max_dev))
                     else:
-                        st.warning("CSV must contain month,mw columns.")
-                except Exception as e:
-                    st.error(f"Failed to read CSV: {e}")
-        profile_key = profile.lower().replace(" ", "_")
-        scenario_preview = None
-        if capacity>0:
-            temp_dict = {
-                "name": name or "(preview)",
+                        fc_re["Ensemble"] = np.maximum(0.0, ens)
+                    st.caption("Weighted preview uses sliders above (normalized to 1.0).")
+                    plot_hero(
+                        combined.to_frame("Combined"),
+                        fc_re,
+                        rjpp_full if has_rjpp else None,
+                        key_suffix="reweighted",
+                        show_bands=show_bands,
+                        bounded=bounded_bands,
+                        max_dev=forecaster.max_dev,
+                        forecast_start=forecast_start_ts,
+                    )
+        else:
+            st.caption("Trained model predictions are required to preview custom weights.")
+
+        with st.expander("Overlay selected model outputs (optional)", expanded=False):
+            st.caption("Overlay lets you visually compare chosen raw model outputs to the ensemble.")
+            available_models = [m for m in MODEL_SLOTS if m in fc_raw.columns]
+            if available_models:
+                default_overlay_slots: List[str] = []
+                if val_results:
+                    val_df_sorted = pd.DataFrame(val_results).T
+                    if "RMSE" in val_df_sorted.columns:
+                        val_df_sorted = val_df_sorted.sort_values("RMSE")
+                        val_df_sorted = val_df_sorted.loc[val_df_sorted.index != "Naive"]
+                        default_overlay_slots = [m for m in val_df_sorted.index if m in available_models][:2]
+                if not default_overlay_slots:
+                    default_overlay_slots = available_models[:2]
+                overlay_labels = {}
+                for m in available_models:
+                    base_label = forecaster.slot_info.get(m, {}).get("impl")
+                    if not base_label:
+                        base_label = "SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m)
+                    overlay_labels[m] = f"{base_label} [{m}]"
+                label_list = [overlay_labels[m] for m in available_models]
+                default_labels = [overlay_labels[m] for m in default_overlay_slots]
+                chosen_labels = st.multiselect("Overlay models", label_list, default=default_labels, key="overlay_pick")
+                chosen_slots = [m for m, lbl in overlay_labels.items() if lbl in chosen_labels]
+                if chosen_slots:
+                    fig_overlay = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+                    shade_start = fc.index.min() if len(fc.index) else None
+                    if shade_start is not None:
+                        shaded(fig_overlay, shade_start, fc.index.max())
+                    for m in chosen_slots:
+                        fig_overlay.add_trace(
+                            go.Scatter(
+                                x=fc_raw.index,
+                                y=fc_raw[m],
+                                name=overlay_labels[m],
+                                mode="lines",
+                                line=dict(width=1.8),
+                            )
+                        )
+                    fig_overlay.add_trace(go.Scatter(x=fc.index, y=fc["Ensemble"], name="Ensemble", line=dict(width=3, color=PALETTE["ensemble"])))
+                    if shade_start is not None:
+                        fig_overlay.add_vline(x=shade_start, line_width=1, line_dash="dot", line_color="orange")
+                    fig_overlay.update_yaxes(ticksuffix=" MW", title_text="Load (MW)")
+                    st.plotly_chart(fig_overlay, use_container_width=True, key="overlay_models")
+            else:
+                st.info("No trained model predictions available for overlay.")
+
+        with st.expander("Correlation heatmap (advanced)", expanded=False):
+            cols_for_corr = [c for c in MODEL_SLOTS if c in fc_raw.columns] + ["Ensemble"]
+            if len(cols_for_corr) >= 2:
+                st.caption("Correlation of model outputs across the forecast horizon.")
+                corr_heatmap(pd.concat([fc_raw[[c for c in cols_for_corr if c != "Ensemble"]], fc["Ensemble"]], axis=1), cols_for_corr)
+            else:
+                st.info("Need at least two model outputs to compute correlations.")
+
+        if "RF" in fc_raw.columns and "XGB" in fc_raw.columns:
+            common_idx = fc_raw.index
+            rf_aligned = fc_raw["RF"].reindex(common_idx)
+            xgb_aligned = fc_raw["XGB"].reindex(common_idx)
+            c = float(rf_aligned.corr(xgb_aligned)) if len(common_idx) > 1 else np.nan
+            if np.isfinite(c) and c >= 0.98:
+                st.warning(f"High similarity detected between RF and XGB (corr={c:.3f}). Check feature leakage or scaler reuse.")
+
+    # ---------- Validation ----------
+    with tab_validation:
+        st.subheader("MAE by Month")
+        mae_rendered = False
+        if (
+            ens_val_metrics
+            and ens_val_pred is not None
+            and val_df_for_bundle is not None
+            and val_index is not None
+            and "Average_Load" in val_df_for_bundle
+            and hasattr(ens_val_pred, "reindex")
+        ):
+            actual = val_df_for_bundle["Average_Load"].reindex(val_index)
+            forecast_err = (actual - ens_val_pred.reindex(val_index)).dropna()
+            if len(forecast_err):
+                mo = forecast_err.groupby(forecast_err.index.month).apply(lambda s: float(np.mean(np.abs(s))))
+                fig_mae = px.bar(mo, labels={"value": "MAE", "index": "Month"})
+                fig_mae.update_layout(PLOTLY_BASE_LAYOUT | {"title": "Monthly validation MAE"})
+                fig_mae.update_yaxes(ticksuffix=" MW")
+                st.plotly_chart(fig_mae, use_container_width=True, key="val_mae_moy_bar")
+                st.caption("Validation mean absolute error by calendar month (lower is better).")
+                mae_rendered = True
+        if not mae_rendered:
+            st.info("MAE by Month becomes available after running validation with holdout windows.")
+
+        if ens_val_metrics and ens_val_pred is not None:
+            naive_rmse_val = naive_metrics.get("RMSE") if naive_metrics else None
+            has_naive_rmse = naive_rmse_val is not None and np.isfinite(naive_rmse_val)
+            columns = st.columns(6) if has_naive_rmse else st.columns(5)
+            c1, c2, c3, c4, c5 = columns[:5]
+            show_metric(c1, "Ensemble RMSE", f"{ens_val_metrics['RMSE']:.2f}", explain_on=st.session_state.get("explain_mode", False))
+            show_metric(c2, "MAE", f"{ens_val_metrics['MAE']:.2f}", explain_on=st.session_state.get("explain_mode", False))
+            show_metric(c3, "MAPE", f"{ens_val_metrics['MAPE']:.2f}%", explain_on=st.session_state.get("explain_mode", False))
+            show_metric(c4, "WAPE", f"{ens_val_metrics['WAPE']:.2f}%", explain_on=st.session_state.get("explain_mode", False))
+            show_metric(c5, "sMAPE", f"{ens_val_metrics['sMAPE']:.2f}%", explain_on=st.session_state.get("explain_mode", False))
+            if has_naive_rmse:
+                delta_pct = ((naive_rmse_val - ens_val_metrics['RMSE']) / naive_rmse_val) * 100 if naive_rmse_val else np.nan
+                label = f"{delta_pct:+.1f}%" if np.isfinite(delta_pct) else "n/a"
+                show_metric(columns[5], "RMSE vs Naive", label, explain_on=st.session_state.get("explain_mode", False))
+
+            cal = calibration_pct
+            if cal is not None and np.isfinite(cal):
+                if 70 <= cal <= 90:
+                    show_metric(st, "Calibration (p10-90 hit rate)", f"{cal:.1f}%", explain_on=st.session_state.get("explain_on", False))
+                elif 60 <= cal < 70 or 90 < cal <= 95:
+                    st.markdown(f"<div style='color:#F59E0B;font-weight:600'>Calibration (p10-90): {cal:.1f}% - tune bands</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<div style='color:#EF4444;font-weight:700'>Calibration (p10-90): {cal:.1f}% - revisit band construction</div>", unsafe_allow_html=True)
+
+        if val_bands is not None and not val_bands.empty and val_df_for_bundle is not None and "Average_Load" in val_df_for_bundle:
+            st.markdown("#### Band coverage by quarter")
+            plot_reliability(
+                val_df_for_bundle["Average_Load"].reindex(val_bands.index),
+                val_bands["p10"],
+                val_bands["p90"],
+            )
+
+        # Add electrical engineering specific metrics
+        ensemble_val_metrics = results.get("ensemble_val_metrics", {})
+        if ensemble_val_metrics:
+            st.markdown("#### Electrical Engineering Metrics")
+            ee_cols = st.columns(4)
+            peak_error = ensemble_val_metrics.get("Peak_Error_MW")
+            dir_acc = ensemble_val_metrics.get("Directional_Accuracy_pct")
+            explain_flag = st.session_state.get("explain_mode", False)
+        
+            if peak_error is not None:
+                show_metric(ee_cols[0], "Peak Load Error", fmt_mw(peak_error), 
+                           explain_on=explain_flag)
+            if dir_acc is not None:
+                show_metric(ee_cols[1], "Directional Accuracy", fmt_pct(dir_acc),
+                           explain_on=explain_flag)
+        
+            # Monthly MAPE breakdown
+            monthly_mape = ensemble_val_metrics.get("monthly_mape", {})
+            if monthly_mape:
+                st.markdown("##### Seasonal Accuracy Breakdown")
+                st.caption("MAPE by month helps identify seasonal biases in forecasting.")
+                monthly_df = pd.DataFrame.from_dict(monthly_mape, orient='index', columns=['MAPE (%)']).sort_index()
+                fig_monthly = px.bar(monthly_df, y='MAPE (%)', 
+                                   title="Monthly Forecast Accuracy (Lower is Better)")
+                fig_monthly.update_layout(PLOTLY_BASE_LAYOUT)
+                st.plotly_chart(fig_monthly, use_container_width=True, key="monthly_mape")
+    
+        with st.expander("Rolling Window Metrics (averaged)", expanded=False):
+            if val_results:
+                st.caption("Average validation metrics across rolling windows (lower is better).")
+                st.dataframe(pd.DataFrame(val_results).T.style.format("{:.3f}"), use_container_width=True)
+            else:
+                st.info("No validation metrics available.")
+
+        with st.expander("Rolling metrics trend", expanded=False):
+            if validation_windows:
+                st.caption("Trend of validation errors over time; default metric is RMSE.")
+                metric_choice = st.selectbox("Metric", ["RMSE", "MAE", "MAPE", "WAPE", "sMAPE"], index=0, key="trend_metric")
+                available_models_trend = list(validation_windows.keys())
+                default_models = available_models_trend[:3] if len(available_models_trend) >= 3 else available_models_trend
+                selected_models_trend = st.multiselect("Models", available_models_trend, default=default_models, key="trend_models")
+                trend_frames = []
+                for m in selected_models_trend:
+                    dfm = validation_windows.get(m)
+                    if dfm is None or metric_choice not in dfm.columns:
+                        continue
+                    temp = dfm.dropna(subset=["window_end", metric_choice]).copy()
+                    if temp.empty:
+                        continue
+                    label = forecaster.slot_info.get(m, {}).get("impl", None)
+                    if not label:
+                        label = "SARIMA(X)" if m == "SARIMAX" else ("Regression (Ridge)" if m == "Ridge" else m)
+                    temp["Model"] = label
+                    trend_frames.append(temp[["window_end", metric_choice, "Model"]])
+                if trend_frames:
+                    trend_df = pd.concat(trend_frames).sort_values("window_end")
+                    fig_trend = px.line(trend_df, x="window_end", y=metric_choice, color="Model")
+                    fig_trend.update_layout(PLOTLY_BASE_LAYOUT)
+                    fig_trend.update_traces(mode="lines+markers")
+                    st.plotly_chart(fig_trend, use_container_width=True, key="val_trend")
+                else:
+                    st.info("No rolling metrics available for the selected models.")
+            else:
+                st.info("Rolling window diagnostics will appear after validation is computed.")
+
+
+    # ---------- Data Quality ----------
+    with tab_quality:
+        dq_summary = getattr(forecaster, "data_quality_summary", {}) or {}
+        dq_cols = st.columns(4)
+        explain_flag = st.session_state.get("explain_mode", False)
+        show_metric(dq_cols[0], "Negative values", dq_summary.get("negatives", 0), explain_on=explain_flag)
+        show_metric(dq_cols[1], "Missing values", dq_summary.get("missing", 0), explain_on=explain_flag)
+        show_metric(dq_cols[2], "Duplicate dates", dq_summary.get("dupe_dates", 0), explain_on=explain_flag)
+        show_metric(dq_cols[3], "Near-zero entries", dq_summary.get("near_zero", 0), explain_on=explain_flag)
+        if dq_summary.get("negatives", 0):
+            st.warning(f"Detected {dq_summary['negatives']} negative load values; they were clipped during preprocessing.")
+        if dq_summary.get("dupe_dates", 0):
+            st.warning(f"Found {dq_summary['dupe_dates']} duplicated timestamps; consider deduplicating upstream.")
+        if dq_summary.get("near_zero", 0):
+            st.info(f"{dq_summary['near_zero']} entries are near zero (<1e-6 MW); double-check units.")
+        src = forecaster.load_df["Average_Load"]
+        missing_months_raw = dq_summary.get("missing_months", [])
+        missing_months_idx = pd.to_datetime(missing_months_raw) if missing_months_raw else pd.DatetimeIndex([])
+        missing_month_count = dq_summary.get("missing_month_count", len(missing_months_idx))
+        duplicate_ts = dq_summary.get("duplicate_timestamps", dq_summary.get("dupe_dates", 0))
+        outlier_points = dq_summary.get("outlier_points", []) or []
+        outlier_count = dq_summary.get("outlier_count", len(outlier_points))
+
+        a, b, c = st.columns(3)
+        show_metric(a, "Missing Months", missing_month_count, explain_on=explain_flag)
+        show_metric(b, "Duplicate Timestamps", duplicate_ts, explain_on=explain_flag)
+        show_metric(c, "Potential Outliers (|z|>3)", outlier_count, explain_on=explain_flag)
+
+        if missing_month_count:
+            st.warning(
+                f"Detected {missing_month_count} missing calendar month(s) within the historical window; "
+                "consider repairing gaps upstream."
+            )
+        if missing_months_idx.size:
+            missing_df = pd.DataFrame({"Date": missing_months_idx}).sort_values("Date")
+            st.write("Missing months:")
+            st.dataframe(missing_df.style.format({"Date": "{:%Y-%m}"}), use_container_width=True)
+            st.download_button("Download missing months", missing_df.to_csv(index=False), "missing_months.csv", "text/csv")
+        longest_gap = dq_summary.get("max_gap_segment", {}) or {}
+        gap_len = int(longest_gap.get("length", 0) or 0)
+        if gap_len > 1:
+            gap_start = pd.to_datetime(longest_gap.get("start"))
+            gap_end = pd.to_datetime(longest_gap.get("end"))
+            if pd.notna(gap_start) and pd.notna(gap_end):
+                st.info(f"Longest missing stretch spans {gap_len} months ({gap_start:%Y-%m} - {gap_end:%Y-%m}).")
+        gap_segment_count = dq_summary.get("gap_segment_count", 0)
+        if gap_segment_count > 1:
+            st.caption(f"Detected {gap_segment_count} distinct gap segments between first and last observation.")
+
+        if outlier_points:
+            out_df = pd.DataFrame(outlier_points)
+            out_df["Date"] = pd.to_datetime(out_df["Date"])
+            out_df = out_df.sort_values("Date")
+            st.write("Potential outliers (|z|>3):")
+            st.dataframe(out_df.style.format({"Date": "{:%Y-%m}", "z_score": "{:.2f}"}), use_container_width=True)
+            st.download_button(
+                "Download outliers",
+                out_df.to_csv(index=False),
+                "outliers.csv",
+                "text/csv",
+            )
+
+        freq = dq_summary.get("inferred_frequency")
+        if freq and freq != "MS":
+            st.warning(f"Inferred calendar frequency is '{freq}'; data was coerced to monthly start for modeling.")
+        if not dq_summary.get("index_monotonic", True):
+            st.warning("Historical index was not strictly increasing; records were sorted before training.")
+        first_obs = dq_summary.get("first_observation")
+        last_obs = dq_summary.get("last_observation")
+        if first_obs and last_obs:
+            st.caption(
+                f"Historical coverage: {pd.to_datetime(first_obs):%Y-%m} - {pd.to_datetime(last_obs):%Y-%m} "
+                f"({len(src)} monthly records)."
+            )
+
+        if has_rjpp:
+            fc_end = fc.index.max() if len(fc.index) else None
+            rjpp_end = rjpp_full.index.max() if rjpp_full is not None and len(rjpp_full.index) else None
+            if fc_end is not None and rjpp_end is not None and rjpp_end < fc_end:
+                st.warning(f"RJPP data ends at {rjpp_end:%Y-%m}; forecast extends to {fc_end:%Y-%m} (RJPP forward-filled).")
+            core_rjpp = getattr(forecaster, "rjpp", None)
+            if core_rjpp is not None and not core_rjpp.empty:
+                overlap_idx = forecaster.load_df.index.intersection(core_rjpp.index)
+                if len(overlap_idx):
+                    load_mean = forecaster.load_df.loc[overlap_idx, "Average_Load"].mean()
+                    rjpp_mean = core_rjpp.loc[overlap_idx, "RJPP"].mean()
+                    if rjpp_mean and np.isfinite(load_mean) and np.isfinite(rjpp_mean):
+                        ratio = load_mean / rjpp_mean
+                        if np.isfinite(ratio) and (ratio < 0.1 or ratio > 10):
+                            st.warning(f"Historical load vs RJPP mean ratio ~{ratio:.2f}; check for unit mismatch (MW vs kW).")
+
+    # ---------- Exports ----------
+    with tab_exports:
+        st.subheader("Downloads")
+        base_col = "p50" if "p50" in fc.columns else "Ensemble"
+        minimal_out = pd.DataFrame(columns=["Date", "Forecast_MW"])
+        annual_energy_summary = pd.DataFrame()
+        if len(fc):
+            minimal_out = pd.DataFrame({"Date": fc.index, "Forecast_MW": fc[base_col].values})
+            if has_rjpp and "RJPP" in fc:
+                minimal_out["RJPP_MW"] = fc["RJPP"].values
+            hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float) * 24
+            energy_mwh = fc[base_col] * hours
+            annual_energy_summary = pd.DataFrame({
+                "Energy_GWh": energy_mwh.groupby(fc.index.year).sum() / 1000,
+                "Average_MW": fc[base_col].groupby(fc.index.year).mean(),
+                "Peak_MW": fc[base_col].groupby(fc.index.year).max(),
+            })
+            if not annual_energy_summary.empty:
+                annual_energy_summary["Load_Factor"] = annual_energy_summary["Average_MW"] / annual_energy_summary["Peak_MW"].replace(0, np.nan)
+                annual_energy_summary.index.name = "Year"
+        today = datetime.now().strftime("%Y-%m-%d")
+        st.download_button("Forecast CSV", fc.to_csv(), f"forecast_base_{today}.csv", "text/csv")
+        st.download_button("Combined CSV", combined.to_csv(), f"combined_{today}.csv", "text/csv")
+        if has_rjpp and rjpp_full is not None:
+            st.download_button("RJPP CSV", rjpp_full.to_csv(), "rjpp_full.csv", "text/csv")
+        if not minimal_out.empty:
+            st.download_button("Minimal Forecast CSV", minimal_out.to_csv(index=False), "forecast_minimal.csv", "text/csv")
+        if not annual_energy_summary.empty:
+            st.download_button("Annual Energy Summary CSV", annual_energy_summary.reset_index().to_csv(index=False), "annual_energy_summary.csv", "text/csv")
+    
+        # Scenario-related exports
+        scenarios_json = json.dumps(st.session_state.scenarios, indent=2, ensure_ascii=False) if st.session_state.get("scenarios") else "[]"
+        st.download_button("Scenarios JSON", scenarios_json, f"scenarios_{today}.json", "application/json")
+    
+        if fc_adj is not None:
+            adj_cols = [col for col in fc_adj.columns if col.endswith('_adj')]
+            if adj_cols:
+                st.download_button("Forecast Adjusted CSV", fc_adj[adj_cols].to_csv(), f"forecast_adjusted_{today}.csv", "text/csv")
+    
+        # Delta comparison export
+        if fc_adj is not None and "Ensemble" in fc.columns:
+            base_col = "p50" if "p50" in fc.columns else "Ensemble"
+            adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else "Ensemble_adj"
+            if adj_col in fc_adj.columns:
+                delta_df = pd.DataFrame({
+                    "Date": fc.index,
+                    "Base_MW": fc[base_col].values,
+                    "Adjusted_MW": fc_adj[adj_col].values,
+                    "Delta_MW": (fc_adj[adj_col] - fc[base_col]).values,
+                    "Delta_Pct": ((fc_adj[adj_col] - fc[base_col]) / fc[base_col] * 100).replace([np.inf, -np.inf], np.nan).values
+                })
+            
+                # Add annual summary
+                delta_annual = pd.DataFrame({
+                    "Year": fc.index.year,
+                    "Base_MW": fc[base_col].values,
+                    "Adjusted_MW": fc_adj[adj_col].values,
+                    "Delta_MW": (fc_adj[adj_col] - fc[base_col]).values
+                }).groupby("Year").agg({
+                    "Base_MW": "mean",
+                    "Adjusted_MW": "mean", 
+                    "Delta_MW": "mean"
+                })
+                delta_annual["Delta_Pct"] = (delta_annual["Delta_MW"] / delta_annual["Base_MW"] * 100).replace([np.inf, -np.inf], np.nan)
+            
+                st.download_button("Delta Base vs Adjusted (Monthly) CSV", delta_df.to_csv(index=False), f"scenario_A_vs_B_{today}_monthly.csv", "text/csv")
+                st.download_button("Delta Base vs Adjusted (Annual) CSV", delta_annual.reset_index().to_csv(index=False), f"scenario_A_vs_B_{today}_annual.csv", "text/csv")
+
+        clamp_mask = None
+        clamped_months = 0
+        clamp_pct = np.nan
+        if has_rjpp and "RJPP" in fc:
+            lo = fc["RJPP"] * (1 - forecaster.max_dev)
+            hi = fc["RJPP"] * (1 + forecaster.max_dev)
+            tol = np.maximum(fc["RJPP"].abs() * 0.002, 0.5)
+            clamp_mask = ((fc["Ensemble"] - lo).abs() <= tol) | ((fc["Ensemble"] - hi).abs() <= tol)
+            clamped_months = int(clamp_mask.sum())
+            clamp_pct = float(clamp_mask.mean() * 100) if len(clamp_mask) else np.nan
+
+        qa_bytes = io.BytesIO()
+        with zipfile.ZipFile(qa_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("forecast.csv", fc.to_csv())
+            zf.writestr("forecast_raw_before_align_noise_clip.csv", fc_raw.to_csv())
+            zf.writestr("combined.csv", combined.to_csv())
+            if not minimal_out.empty:
+                zf.writestr("forecast_minimal.csv", minimal_out.to_csv(index=False))
+            if not annual_energy_summary.empty:
+                zf.writestr("annual_energy_summary.csv", annual_energy_summary.reset_index().to_csv(index=False))
+            tmp = fc.copy(); tmp["Year"] = tmp.index.year
+            cols = [c for c in ["Ensemble", "p10", "p50", "p90"] if c in tmp.columns]
+            annual = tmp.groupby("Year")[cols].mean()
+            annual["YoY_%"] = annual[( "p50" if "p50" in annual.columns else "Ensemble")].pct_change()*100
+            zf.writestr("yearly_means_p10_p50_p90.csv", annual.to_csv())
+            if val_results:
+                zf.writestr("validation_metrics_averaged.csv", pd.DataFrame(val_results).T.to_csv())
+            if ens_val_metrics and ens_val_pred is not None and val_df_for_bundle is not None and results.get("val_index") is not None:
+                val_idx = results["val_index"]
+                val_df_out = pd.DataFrame(index=val_idx)
+                val_df_out["Actual"] = val_df_for_bundle["Average_Load"].reindex(val_idx)
+                for m, arr in forecaster.val_preds.items():
+                    s = pd.Series(arr); val_df_out[m] = s.reindex(val_idx)
+                val_df_out["Ensemble_val"] = ens_val_pred.reindex(val_idx)
+                zf.writestr("validation_window_preds.csv", val_df_out.to_csv())
+            if validation_windows:
+                frames = []
+                for name, dfm in validation_windows.items():
+                    df_local = dfm.copy()
+                    df_local["Model"] = name
+                    frames.append(df_local)
+                if frames:
+                    vw_df = pd.concat(frames)
+                    zf.writestr("validation_windows_metrics.csv", vw_df.to_csv(index=False))
+            models_used = {
+                slot: {
+                    "implementation": forecaster.slot_info.get(slot, {}).get("impl", ""),
+                    "status": forecaster.slot_info.get(slot, {}).get("status", forecaster.model_status.get(slot, "unknown")),
+                    "weight": float(weights.get(slot, 0.0))
+                }
+                for slot in MODEL_SLOTS
+            }
+            zf.writestr("models_used.json", json.dumps(models_used, indent=2))
+            if has_rjpp and "RJPP" in fc:
+                dev = (fc["Ensemble"] - fc["RJPP"]) / fc["RJPP"] * 100
+                zf.writestr("rjpp_monthly_deviation.csv", pd.DataFrame({"Date": dev.index, "dev%": dev.values, "abs_dev%": dev.abs().values}).to_csv(index=False))
+            calibration_display = f"{calibration_pct:.1f}%" if calibration_pct is not None and np.isfinite(calibration_pct) else "n/a"
+            clamp_line = "n/a" if not has_rjpp else (f"{clamped_months}/{len(fc)} ({clamp_pct:.1f}%)" if len(fc) else "0")
+            settings = f"""Run Settings:
+    - Forecast: {_month_start(forecast_start):%b %Y} -> {_month_start(forecast_end):%b %Y}
+    - Ensemble method: {ensemble_choice} (auto-selected from PRESETS)
+    - Annual anchor tolerance: ±{PRESETS['annual_anchor_tolerance']*100:.1f}%
+    - Horizon-aware caps: h1-3={PRESETS['horizon_max_dev']['h1_3']*100:.0f}%, h4-6={PRESETS['horizon_max_dev']['h4_6']*100:.0f}%, h7-12={PRESETS['horizon_max_dev']['h7_12']*100:.0f}%, h13+={PRESETS['horizon_max_dev']['h13p']*100:.0f}%
+    - MoM caps (horizon-aware): h1-12={PRESETS['mom_cap']['h1_12']*100:.0f}%, h13+={PRESETS['mom_cap']['h13p']*100:.0f}%
+    - Residual noise: {"On" if forecaster.add_noise else "Off"} (scale={forecaster.noise_scale:.2f})
+    - Use RJPP: {"Yes" if forecaster.use_rjpp else "No"}
+    - Residualize (effective): {"Yes" if getattr(forecaster, '_residualize_effective', False) else "No"}
+    - Seasonal strength: {getattr(forecaster, 'seasonal_strength', 0.0):.3f}
+    - Guard scope: {forecaster.apply_guards_to}
+    - Smoothing alpha: {PRESETS['smoothing_alpha']:.2f} (disabled)
+    - Calibration (p10-90 target): {PRESETS['band_target_coverage']*100:.0f}%
+    - Calibration (actual): {calibration_display}
+    - Band calibration k: {forecaster.band_k:.3f}
+    - Validation RMSE (weighted): {getattr(forecaster, 'val_rmse_weighted', np.nan):.2f}
+    - Validation RMSE (meta): {getattr(forecaster, 'val_rmse_meta', np.nan):.2f}
+    - Models available: {", ".join([m for m,s in model_status.items() if s=="ok"])}
+    - Models unavailable: {", ".join([m for m,s in model_status.items() if s!="ok"])}
+    - Python: {sys.version.split()[0]}
+    - numpy: {np.__version__}; pandas: {pd.__version__}; plotly: {plotly.__version__}; statsmodels: {sm.__version__}; sklearn: {sklearn_version}
+    """
+            zf.writestr("settings.txt", settings)
+        st.download_button("QA bundle (.zip)", qa_bytes.getvalue(), f"qa_bundle_{today}.zip", "application/zip")
+
+        if has_rjpp and "RJPP" in fc and "Ensemble" in fc:
+            st.subheader("Annual Re-anchor Check (target <=1.0%)")
+            rows=[]
+            for y in sorted(fc.index.year.unique()):
+                mask = fc.index.year==y
+                yr_mean = fc.loc[mask,"Ensemble"].mean()
+                dec_val = fc.loc[fc.index==pd.Timestamp(y,12,1),"RJPP"]
+                if len(dec_val):
+                    rjpp_dec = float(dec_val.values[0])
+                    gap = abs((yr_mean - rjpp_dec)/rjpp_dec)*100 if rjpp_dec else np.nan
+                    status = "Pass" if gap <= 1.0 else ("Watch" if gap <= 1.5 else "Fail")
+                    rows.append({"Year":y,"Gap_%":gap,"Status":status})
+            if rows:
+                df_anchor = pd.DataFrame(rows)
+                st.dataframe(df_anchor.style.format({"Gap_%":"{:.2f}"}), use_container_width=True)
+
+        if ui_log_handler.buffer:
+            st.subheader("Pipeline Logs")
+            st.code("\n".join(ui_log_handler.buffer[-200:]), language="text")
+
+    # ---------- Scenarios tab (consolidated builder, manager, compare) ----------
+    #############################
+    # Redesigned Scenario Tab   #
+    #############################
+
+    # --- Helper: Month utilities for new UI ---
+    def _ym_to_first_of_month(year: int, month: int) -> str:
+        return f"{year:04d}-{month:02d}-01"
+
+    def _parse_month(s: str) -> pd.Timestamp:
+        return pd.to_datetime(s).to_period("M").to_timestamp()
+
+    def validate_scenario_dict(d: dict) -> list[str]:
+        errors = []
+        if not d.get("name"):
+            errors.append("Name is required.")
+        # Accept either capacity_mw or mw
+        capacity = d.get("capacity_mw") or d.get("mw", 0)
+        if capacity <= 0:
+            errors.append("Capacity must be > 0.")
+        profile = d.get("profile")
+        start = d.get("start_month")
+        peak = d.get("peak_month")
+        plateau = d.get("plateau_end")
+        retire = d.get("retire_month")
+        def _to_ts(x):
+            return pd.to_datetime(x).to_period("M").to_timestamp() if x else None
+        ts_start, ts_peak, ts_plateau, ts_retire = map(_to_ts, [start, peak, plateau, retire])
+        if profile in ("ramp", "s_curve") and not peak:
+            errors.append("Peak month required for Ramp / S-curve.")
+        ordering = [(ts_start, "Start"), (ts_peak, "Peak"), (ts_plateau, "PlateauEnd"), (ts_retire, "Retire")]
+        prev = None
+        for ts, label in ordering:
+            if ts is None:
+                continue
+            if prev and ts < prev:
+                errors.append(f"Month ordering invalid: {label} before previous milestone.")
+            prev = ts
+        if profile == "custom_csv":
+            if not d.get("_uploaded_valid", False):
+                errors.append("Custom CSV not uploaded or invalid.")
+        return errors
+
+    @st.cache_data(show_spinner=False)
+    def _hash_scenario_for_cache(d: dict) -> str:
+        keys = [k for k in d.keys() if not k.startswith("_") and k not in ("active", "priority")]
+        blob = json.dumps({k: d.get(k) for k in sorted(keys)}, sort_keys=True)
+        return hashlib.md5(blob.encode()).hexdigest()
+
+    def _index_signature(index: pd.DatetimeIndex | None) -> str:
+        """Return a compact, hashable signature describing a DatetimeIndex."""
+        try:
+            if index is None or len(index) == 0:
+                return "0:None:None:None"
+            first = pd.to_datetime(index[0]).strftime('%Y-%m-%d')
+            last = pd.to_datetime(index[-1]).strftime('%Y-%m-%d')
+            # freqstr may be None for irregular indexes
+            freq = getattr(index, 'freqstr', None) or (str(getattr(index, 'freq', None)) if getattr(index, 'freq', None) else 'None')
+            return f"{len(index)}:{first}:{last}:{freq}"
+        except Exception:
+            # As a last resort, use md5 of the stringified values (avoid huge keys)
+            try:
+                vals = ",".join(pd.to_datetime(index).strftime('%Y-%m-%d').tolist()) if index is not None else ""
+                return hashlib.md5(vals.encode()).hexdigest()
+            except Exception:
+                return "unknown_index"
+
+    @st.cache_data(show_spinner=False)
+    def build_scenario_series(d: dict, _index: pd.DatetimeIndex, index_sig: str) -> pd.Series:
+        """Return a monthly MW series for the scenario aligned to index."""
+        profile = d.get("profile")
+        cap = float(d.get("capacity_mw", 0.0) or 0.0)
+        start = d.get("start_month")
+        peak = d.get("peak_month")
+        plateau = d.get("plateau_end")
+        retire = d.get("retire_month")
+        if profile == "step":
+            # Use existing step implementation logic (reuse scenario_engine if possible)
+            from scenario_engine import step_profile
+            return step_profile(cap, _index, start, retire)
+        elif profile == "ramp":
+            from scenario_engine import ramp_profile
+            return ramp_profile(cap, _index, start, peak, plateau, retire)
+        elif profile == "s_curve":
+            from scenario_engine import s_curve_profile
+            if not peak:
+                return pd.Series(0.0, index=_index)
+            return s_curve_profile(cap, _index, start, peak)
+        elif profile == "custom_csv":
+            path = d.get("_custom_csv_path")
+            if not path:
+                return pd.Series(0.0, index=_index)
+            try:
+                df = pd.read_csv(path)
+                if not {"month", "mw"}.issubset({c.lower() for c in df.columns}):
+                    return pd.Series(0.0, index=_index)
+                # Normalize column names
+                col_map = {c: c.lower() for c in df.columns}
+                df.columns = [c.lower() for c in df.columns]
+                df["month"] = pd.to_datetime(df["month"]).dt.to_period("M").dt.to_timestamp()
+                monthly = df.set_index("month")["mw"].astype(float).reindex(_index).fillna(0.0)
+                # Enforce non-negative
+                return monthly.clip(lower=0.0)
+            except Exception:
+                return pd.Series(0.0, index=_index)
+        else:
+            return pd.Series(0.0, index=_index)
+
+    def compute_planned_components(scenarios: list[dict], index: pd.DatetimeIndex) -> dict[str, pd.Series]:
+        active = [s for s in scenarios if s.get("active", True)]
+        # Normalize priority: existing integer or fallback to list order
+        for i, s in enumerate(active):
+            if "priority" not in s or s["priority"] is None or not isinstance(s["priority"], int):
+                s["priority"] = i
+        ordered = sorted(active, key=lambda x: x.get("priority", 0))
+        comp = {}
+        idx_sig = _index_signature(index)
+        for scn in ordered:
+            series = build_scenario_series(scn, index, idx_sig)
+            comp[scn["name"]] = series
+        return comp
+
+    def sum_components(components: dict[str, pd.Series]) -> pd.Series:
+        if not components:
+            return pd.Series(dtype=float)
+        total = None
+        for s in components.values():
+            if total is None:
+                total = s.astype(float)
+            else:
+                total = total.add(s.astype(float), fill_value=0.0)
+        return total.clip(lower=0.0) if total is not None else pd.Series(dtype=float)
+
+    def plot_stacked_overlay(components: dict[str, pd.Series], base_df: pd.DataFrame, adjusted_df: pd.DataFrame | None) -> go.Figure:
+        fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+        # Stacked components
+        for name, series in components.items():
+            fig.add_trace(go.Scatter(x=series.index, y=series.values, name=name, mode="lines", stackgroup="scn", line=dict(width=1)))
+        base_col = "p50" if "p50" in base_df.columns else "Ensemble"
+        fig.add_trace(go.Scatter(x=base_df.index, y=base_df[base_col], name="Base p50", mode="lines", line=dict(width=2, dash="dot", color="#555")))
+        if adjusted_df is not None:
+            adj_col = "p50_adj" if "p50_adj" in adjusted_df.columns else ("Ensemble_adj" if "Ensemble_adj" in adjusted_df.columns else None)
+            if adj_col:
+                fig.add_trace(go.Scatter(x=adjusted_df.index, y=adjusted_df[adj_col], name="Adjusted p50", mode="lines", line=dict(width=3, color=PALETTE.get("scenario", "#D97706"))))
+        fig.update_yaxes(title_text="MW", ticksuffix=" MW", rangemode="tozero")
+        fig.update_layout(title="Stacked Scenario Overlay")
+        return fig
+
+    def plot_annual_impact(adjusted_df: pd.DataFrame, base_df: pd.DataFrame) -> go.Figure:
+        base_col = "p50" if "p50" in base_df.columns else "Ensemble"
+        adj_col = "p50_adj" if "p50_adj" in adjusted_df.columns else ("Ensemble_adj" if "Ensemble_adj" in adjusted_df.columns else None)
+        fig = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+        if adj_col is None:
+            return fig
+        b = base_df[base_col].groupby(base_df.index.year).mean()
+        a = adjusted_df[adj_col].groupby(adjusted_df.index.year).mean()
+        years = sorted(set(b.index).union(a.index))
+        delta_mw = []
+        for y in years:
+            bv = b.get(y, np.nan)
+            av = a.get(y, np.nan)
+            delta_mw.append(av - bv if (np.isfinite(av) and np.isfinite(bv)) else np.nan)
+        fig.add_trace(go.Bar(x=[str(y) for y in years], y=delta_mw, name="ΔMW", marker_color=["green" if (v or 0) >=0 else "red" for v in delta_mw]))
+        fig.update_yaxes(title_text="Δ Avg MW")
+        fig.update_layout(title="Annual Impact (Adjusted - Base)")
+        return fig
+
+    def compute_kpis(base_df: pd.DataFrame, adjusted_df: pd.DataFrame | None, rjpp_df: pd.DataFrame | None) -> dict:
+        base_col = "p50" if "p50" in base_df.columns else "Ensemble"
+        adj_col = None
+        if adjusted_df is not None:
+            adj_col = "p50_adj" if "p50_adj" in adjusted_df.columns else ("Ensemble_adj" if "Ensemble_adj" in adjusted_df.columns else None)
+        out = {}
+        base_peak = base_df[base_col].max() if len(base_df) else np.nan
+        base_peak_month = base_df[base_col].idxmax() if len(base_df) else None
+        out["base_peak_mw"] = float(base_peak) if np.isfinite(base_peak) else np.nan
+        out["base_peak_month"] = base_peak_month
+        if adj_col:
+            adj_peak = adjusted_df[adj_col].max()
+            adj_peak_month = adjusted_df[adj_col].idxmax()
+        else:
+            adj_peak = np.nan; adj_peak_month = None
+        out["delta_peak_mw"] = (adj_peak - base_peak) if np.isfinite(adj_peak) and np.isfinite(base_peak) else np.nan
+        out["delta_peak_month"] = adj_peak_month
+        # Average next 12 months
+        def _avg12(df, col):
+            if df is None or col is None or col not in df.columns or df.empty:
+                return np.nan
+            return float(df[col].iloc[:12].mean()) if len(df) >= 1 else np.nan
+        base_avg12 = _avg12(base_df, base_col)
+        adj_avg12 = _avg12(adjusted_df, adj_col) if adj_col else np.nan
+        out["delta_avg_mw"] = (adj_avg12 - base_avg12) if np.isfinite(base_avg12) and np.isfinite(adj_avg12) else np.nan
+        out["delta_avg_pct"] = ((adj_avg12 / base_avg12) - 1) * 100 if np.isfinite(base_avg12) and base_avg12>0 and np.isfinite(adj_avg12) else np.nan
+        # RJPP compliance simple calc
+        def _compliance(df, col):
+            if df is None or col is None or "RJPP" not in df.columns:
+                return np.nan
+            working = df[[col, "RJPP"]].dropna()
+            if working.empty:
+                return np.nan
+            series = (working[col] - working["RJPP"]).abs() / working["RJPP"].replace(0, np.nan)
+            series = series.dropna()
+            if series.empty:
+                return np.nan
+            return float((series <= getattr(st.session_state.forecaster, 'max_dev', 0.05)).mean()*100)
+        if rjpp_df is not None:
+            base_tmp = base_df.copy(); base_tmp["RJPP"] = rjpp_df["RJPP"].reindex(base_df.index)
+            out["rjpp_base_pct"] = _compliance(base_tmp, base_col)
+            if adj_col and adjusted_df is not None:
+                adj_tmp = adjusted_df.copy(); adj_tmp["RJPP"] = rjpp_df["RJPP"].reindex(adjusted_df.index)
+                out["rjpp_adj_pct"] = _compliance(adj_tmp, adj_col)
+                if np.isfinite(out.get("rjpp_base_pct", np.nan)) and np.isfinite(out.get("rjpp_adj_pct", np.nan)):
+                    out["rjpp_delta_pp"] = out["rjpp_adj_pct"] - out["rjpp_base_pct"]
+                else:
+                    out["rjpp_delta_pp"] = np.nan
+            else:
+                out["rjpp_adj_pct"] = np.nan; out["rjpp_delta_pp"] = np.nan
+        else:
+            out.update({"rjpp_base_pct": np.nan, "rjpp_adj_pct": np.nan, "rjpp_delta_pp": np.nan})
+        # Placeholder clamped metrics (reuse if base_df already has them calculated externally)
+        out["clamped_months_base"] = np.nan
+        out["clamped_months_adj"] = np.nan
+        out["worst_anchor_gap_category"] = None
+        return out
+
+    def ui_quick_planner_form():
+        st.markdown("#### Quick Planner")
+        with st.container(border=True):
+            colA, colB = st.columns([1,1])
+            with colA:
+                name = st.text_input("Name", key="qp_name", help="Unique scenario name.")
+            with colB:
+                capacity = st.number_input("Capacity (MW)", min_value=0.0, value=0.0, step=10.0, key="qp_cap", help="Peak incremental load contribution in MW.")
+            # Start month pickers
+            now_year = datetime.now().year
+            years = list(range(now_year, now_year+20))
+            colY, colM = st.columns([1,1])
+            with colY:
+                start_year = st.selectbox("Start year", years, index=0, key="qp_start_year")
+            with colM:
+                start_month = st.selectbox("Start month", list(range(1,13)), index=0, key="qp_start_month")
+            start_month_str = _ym_to_first_of_month(start_year, start_month)
+            profile = st.selectbox("Profile type", ["Step","Ramp","S-curve","Custom CSV"], key="qp_profile", help="Shape of build-up over time.")
+            # Conditional fields
+            peak_month = plateau_end = retire_month = None
+            if profile in ("Ramp", "S-curve"):
+                col1, col2 = st.columns([1,1])
+                with col1:
+                    peak_year = st.selectbox("Peak year", years, index=min(1, len(years)-1), key="qp_peak_year", help="Month when full capacity is first reached.")
+                with col2:
+                    peak_m = st.selectbox("Peak month", list(range(1,13)), index=5, key="qp_peak_month")
+                peak_month = _ym_to_first_of_month(peak_year, peak_m)
+                colp1, colp2 = st.columns([1,1])
+                with colp1:
+                    plateau_flag = st.checkbox("Plateau end?", value=False, key="qp_plateau_flag")
+                if plateau_flag:
+                    with colp2:
+                        plateau_year = st.selectbox("Plateau end year", years, index=min(2,len(years)-1), key="qp_plateau_year")
+                    plateau_m = st.selectbox("Plateau end month", list(range(1,13)), index=0, key="qp_plateau_month")
+                    plateau_end = _ym_to_first_of_month(st.session_state.qp_plateau_year, plateau_m)
+                retire_flag = st.checkbox("Retire?", value=False, key="qp_retire_flag")
+                if retire_flag:
+                    retire_year = st.selectbox("Retire year", years, index=min(3,len(years)-1), key="qp_retire_year")
+                    retire_m = st.selectbox("Retire month", list(range(1,13)), index=0, key="qp_retire_month")
+                    retire_month = _ym_to_first_of_month(retire_year, retire_m)
+            uploaded_path = None
+            upload_valid = False
+            if profile == "Custom CSV":
+                csv_file = st.file_uploader("Upload custom CSV", type=["csv"], key="qp_upload", help="Columns: month (YYYY-MM-01), mw (float).")
+                if csv_file is not None:
+                    try:
+                        tmp_path = _save_file(csv_file, "custom_scn_")
+                        df = pd.read_csv(tmp_path)
+                        if {"month", "mw"}.issubset({c.lower() for c in df.columns}):
+                            uploaded_path = tmp_path
+                            upload_valid = True
+                        else:
+                            st.warning("CSV must contain month,mw columns.")
+                    except Exception as e:
+                        st.error(f"Failed to read CSV: {e}")
+            profile_key = profile.lower().replace(" ", "_")
+            scenario_preview = None
+            if capacity>0:
+                temp_dict = {
+                    "name": name or "(preview)",
+                    "capacity_mw": capacity,
+                    "start_month": start_month_str,
+                    "profile": profile_key if profile_key != "custom_csv" else "custom_csv",
+                    "peak_month": peak_month,
+                    "plateau_end": plateau_end,
+                    "retire_month": retire_month,
+                    "_custom_csv_path": uploaded_path,
+                    "_uploaded_valid": upload_valid,
+                    "active": True,
+                    "priority": 0,
+                }
+                errs = validate_scenario_dict(temp_dict)
+                if not errs:
+                    idx = st.session_state.results["forecast"].index if st.session_state.get("results") else pd.date_range(start_month_str, periods=24, freq="MS")
+                    scenario_preview = build_scenario_series(temp_dict, idx, _index_signature(idx))
+                else:
+                    for e in errs:
+                        st.error(e)
+            st.markdown("Preview")
+            if scenario_preview is not None:
+                fig_prev = go.Figure(layout=PLOTLY_BASE_LAYOUT)
+                fig_prev.add_trace(go.Scatter(x=scenario_preview.index, y=scenario_preview.values, mode="lines", name="Profile"))
+                fig_prev.update_layout(height=180, margin=dict(l=10,r=10,t=20,b=10))
+                st.plotly_chart(fig_prev, use_container_width=True)
+            else:
+                st.caption("Fill required fields to preview profile…")
+            save_btn, reset_btn = st.columns([1,1])
+            with save_btn:
+                do_save = st.button("Save scenario", type="primary", key="qp_save")
+            with reset_btn:
+                do_reset = st.button("Reset form", key="qp_reset")
+        # Handle actions
+        saved = None
+        if do_reset:
+            for k in [k for k in st.session_state.keys() if k.startswith("qp_")]:
+                st.session_state.pop(k, None)
+            st.experimental_rerun()
+        if do_save:
+            record = {
+                "name": name.strip() if name else f"Scenario {len(st.session_state.scenarios)+1}",
                 "capacity_mw": capacity,
                 "start_month": start_month_str,
                 "profile": profile_key if profile_key != "custom_csv" else "custom_csv",
                 "peak_month": peak_month,
                 "plateau_end": plateau_end,
                 "retire_month": retire_month,
+                "probability": None,
+                "priority": len(st.session_state.scenarios),
+                "active": True,
                 "_custom_csv_path": uploaded_path,
                 "_uploaded_valid": upload_valid,
-                "active": True,
-                "priority": 0,
             }
-            errs = validate_scenario_dict(temp_dict)
-            if not errs:
-                idx = st.session_state.results["forecast"].index if st.session_state.get("results") else pd.date_range(start_month_str, periods=24, freq="MS")
-                scenario_preview = build_scenario_series(temp_dict, idx, _index_signature(idx))
+            errs = validate_scenario_dict(record)
+            existing_names = {s.get("name", "").lower() for s in st.session_state.scenarios}
+            if record["name"].lower() in existing_names:
+                # auto suffix
+                base = record["name"]
+                i = 2
+                while f"{base} ({i})".lower() in existing_names:
+                    i += 1
+                record["name"] = f"{base} ({i})"
+            if errs:
+                for e in errs: st.error(e)
             else:
-                for e in errs:
-                    st.error(e)
-        st.markdown("Preview")
-        if scenario_preview is not None:
-            fig_prev = go.Figure(layout=PLOTLY_BASE_LAYOUT)
-            fig_prev.add_trace(go.Scatter(x=scenario_preview.index, y=scenario_preview.values, mode="lines", name="Profile"))
-            fig_prev.update_layout(height=180, margin=dict(l=10,r=10,t=20,b=10))
-            st.plotly_chart(fig_prev, use_container_width=True)
-        else:
-            st.caption("Fill required fields to preview profile…")
-        save_btn, reset_btn = st.columns([1,1])
-        with save_btn:
-            do_save = st.button("Save scenario", type="primary", key="qp_save")
-        with reset_btn:
-            do_reset = st.button("Reset form", key="qp_reset")
-    # Handle actions
-    saved = None
-    if do_reset:
-        for k in [k for k in st.session_state.keys() if k.startswith("qp_")]:
-            st.session_state.pop(k, None)
-        st.experimental_rerun()
-    if do_save:
-        record = {
-            "name": name.strip() if name else f"Scenario {len(st.session_state.scenarios)+1}",
-            "capacity_mw": capacity,
-            "start_month": start_month_str,
-            "profile": profile_key if profile_key != "custom_csv" else "custom_csv",
-            "peak_month": peak_month,
-            "plateau_end": plateau_end,
-            "retire_month": retire_month,
-            "probability": None,
-            "priority": len(st.session_state.scenarios),
-            "active": True,
-            "_custom_csv_path": uploaded_path,
-            "_uploaded_valid": upload_valid,
-        }
-        errs = validate_scenario_dict(record)
-        existing_names = {s.get("name", "").lower() for s in st.session_state.scenarios}
-        if record["name"].lower() in existing_names:
-            # auto suffix
-            base = record["name"]
-            i = 2
-            while f"{base} ({i})".lower() in existing_names:
-                i += 1
-            record["name"] = f"{base} ({i})"
-        if errs:
-            for e in errs: st.error(e)
-        else:
-            st.session_state.scenarios.append(record)
-            st.success(f"Saved scenario '{record['name']}'.")
-            saved = record
-    return saved
+                st.session_state.scenarios.append(record)
+                st.success(f"Saved scenario '{record['name']}'.")
+                saved = record
+        return saved
 
-def ui_scenarios_tab():
-    st.subheader("Scenario Planning")
-    top_cols = st.columns([1,1,1])
-    with top_cols[0]:
-        st.session_state.apply_scenarios = st.toggle("Apply scenarios to forecast", value=st.session_state.get("apply_scenarios", False), key="apply_scenarios_master")
-    with top_cols[1]:
-        explain_flag = st.toggle("Explain mode", value=st.session_state.get("scn_explain", False), key="scn_explain")
-    with top_cols[2]:
-        st.caption(f"Active scenarios: {sum(1 for s in st.session_state.scenarios if s.get('active'))}")
-    # Two-column layout
-    col_left, col_right = st.columns([1,1])
-    with col_left:
-        saved = ui_quick_planner_form()
-    with col_right:
-        st.markdown("#### Library")
-        if not st.session_state.scenarios:
-            st.info("No scenarios yet. Create one using Quick Planner.")
-        else:
-            # Render cards
-            for i, scn in enumerate(st.session_state.scenarios):
-                with st.container(border=True):
-                    header_cols = st.columns([0.6,0.4])
-                    with header_cols[0]:
-                        st.markdown(f"**{scn.get('name')}**")
-                    with header_cols[1]:
-                        scn["active"] = st.checkbox("Active", value=scn.get("active", True), key=f"scn_active_{i}")
-                    chips = []
-                    chips.append(f"{int(scn.get('capacity_mw', scn.get('mw',0)))} MW")
-                    chips.append(scn.get("profile","?").replace("_"," "))
-                    if scn.get("probability") is not None:
-                        chips.append(f"P={scn['probability']:.2f}")
-                    st.caption(" | ".join(chips))
-                    dates_line = []
-                    for lbl, key in [("Start","start_month"),("Peak","peak_month"),("Plateau","plateau_end"),("Retire","retire_month")]:
-                        if scn.get(key):
-                            dates_line.append(f"{lbl}:{scn[key][:7]}")
-                    if dates_line:
-                        st.write("; ".join(dates_line))
-                    btn_c1, btn_c2, btn_c3, btn_c4 = st.columns([0.25,0.25,0.25,0.25])
-                    with btn_c1:
-                        if st.button("↑", key=f"scn_up_{i}", help="Higher priority") and i>0:
-                            st.session_state.scenarios[i-1], st.session_state.scenarios[i] = st.session_state.scenarios[i], st.session_state.scenarios[i-1]
-                    with btn_c2:
-                        if st.button("↓", key=f"scn_down_{i}", help="Lower priority") and i < len(st.session_state.scenarios)-1:
-                            st.session_state.scenarios[i+1], st.session_state.scenarios[i] = st.session_state.scenarios[i], st.session_state.scenarios[i+1]
-                    with btn_c3:
-                        if st.button("Duplicate", key=f"scn_dup_{i}"):
-                            dup = scn.copy(); dup["name"] = f"{dup['name']} (copy)"; st.session_state.scenarios.append(dup)
-                    with btn_c4:
-                        if st.button("Delete", key=f"scn_del_{i}"):
-                            st.session_state.scenarios.pop(i); st.experimental_rerun()
-    # Impact & Compare full width
-    st.markdown("#### Impact & Compare")
-    forecast_idx = st.session_state.results["forecast"].index
-    components = {}
-    overlay = None
-    adjusted = None
-    if st.session_state.apply_scenarios and any(s.get("active", True) for s in st.session_state.scenarios):
-        components = compute_planned_components(st.session_state.scenarios, forecast_idx)
-        overlay = sum_components(components)
-        if overlay is not None and len(overlay):
-            # For scenario analysis, adjustments must reflect the physical addition
-            # of load without policy clamps. We therefore do NOT bound the
-            # adjusted series to RJPP here (clamp_to_rjpp=False). This ensures a
-            # 100 MW scenario peak truly adds ~100 MW to the corresponding
-            # months in the adjusted p50/Ensemble, matching the stacked overlay.
-            rjpp_series = (
-                st.session_state.results["forecast"].get("RJPP")
-                if "RJPP" in st.session_state.results["forecast"].columns
-                else None
-            )
-            adjusted = apply_scenarios_to_bands(
-                st.session_state.results["forecast"],
-                overlay,
-                rjpp_series,
-                st.session_state.forecaster.max_dev,
-                clamp_to_rjpp=False,
-            )
-    if not st.session_state.apply_scenarios:
-        st.info("Scenarios not applied. Toggle 'Apply scenarios to forecast' above.")
-    elif not any(s.get("active", True) for s in st.session_state.scenarios):
-        st.warning("No active scenarios. Activate at least one in the library.")
-    # Charts
-    if components:
-        fig_overlay = plot_stacked_overlay(components, st.session_state.results["forecast"], adjusted)
-        st.plotly_chart(fig_overlay, use_container_width=True)
-    st.markdown("#### Scenario comparison")
-    base_forecast = st.session_state.results["forecast"]
-    combined_series = st.session_state.combined
-    rjpp_full_local = st.session_state.rjpp_full if st.session_state.rjpp_full is not None else None
-    if isinstance(combined_series, pd.Series):
-        combined_frame = combined_series.to_frame(name="Combined")
-    elif isinstance(combined_series, pd.DataFrame):
-        combined_frame = combined_series
-    else:
-        combined_frame = pd.DataFrame()
-    col_base, col_adjusted = st.columns(2)
-    with col_base:
-        st.markdown("**Base forecast**")
-        plot_hero(
-            combined_frame,
-            base_forecast,
-            rjpp_full_local,
-            key_suffix="scenario_base",
-            show_bands=show_bands,
-            bounded=bounded_bands,
-            max_dev=forecaster.max_dev,
-            forecast_start=forecast_start_ts,
-        )
-    with col_adjusted:
-        st.markdown("**Scenario-adjusted**")
-        if adjusted is not None:
-            combined_adjusted = st.session_state.combined_adjusted if st.session_state.combined_adjusted is not None else combined_series
-            if isinstance(combined_adjusted, pd.Series):
-                combined_adjusted_frame = combined_adjusted.to_frame(name="Combined")
-            elif isinstance(combined_adjusted, pd.DataFrame):
-                combined_adjusted_frame = combined_adjusted
+    def ui_scenarios_tab():
+        st.subheader("Scenario Planning")
+        top_cols = st.columns([1,1,1])
+        with top_cols[0]:
+            st.session_state.apply_scenarios = st.toggle("Apply scenarios to forecast", value=st.session_state.get("apply_scenarios", False), key="apply_scenarios_master")
+        with top_cols[1]:
+            explain_flag = st.toggle("Explain mode", value=st.session_state.get("scn_explain", False), key="scn_explain")
+        with top_cols[2]:
+            st.caption(f"Active scenarios: {sum(1 for s in st.session_state.scenarios if s.get('active'))}")
+        # Two-column layout
+        col_left, col_right = st.columns([1,1])
+        with col_left:
+            saved = ui_quick_planner_form()
+        with col_right:
+            st.markdown("#### Library")
+            if not st.session_state.scenarios:
+                st.info("No scenarios yet. Create one using Quick Planner.")
             else:
-                combined_adjusted_frame = combined_frame
+                # Render cards
+                for i, scn in enumerate(st.session_state.scenarios):
+                    with st.container(border=True):
+                        header_cols = st.columns([0.6,0.4])
+                        with header_cols[0]:
+                            st.markdown(f"**{scn.get('name')}**")
+                        with header_cols[1]:
+                            scn["active"] = st.checkbox("Active", value=scn.get("active", True), key=f"scn_active_{i}")
+                        chips = []
+                        chips.append(f"{int(scn.get('capacity_mw', scn.get('mw',0)))} MW")
+                        chips.append(scn.get("profile","?").replace("_"," "))
+                        if scn.get("probability") is not None:
+                            chips.append(f"P={scn['probability']:.2f}")
+                        st.caption(" | ".join(chips))
+                        dates_line = []
+                        for lbl, key in [("Start","start_month"),("Peak","peak_month"),("Plateau","plateau_end"),("Retire","retire_month")]:
+                            if scn.get(key):
+                                dates_line.append(f"{lbl}:{scn[key][:7]}")
+                        if dates_line:
+                            st.write("; ".join(dates_line))
+                        btn_c1, btn_c2, btn_c3, btn_c4 = st.columns([0.25,0.25,0.25,0.25])
+                        with btn_c1:
+                            if st.button("↑", key=f"scn_up_{i}", help="Higher priority") and i>0:
+                                st.session_state.scenarios[i-1], st.session_state.scenarios[i] = st.session_state.scenarios[i], st.session_state.scenarios[i-1]
+                        with btn_c2:
+                            if st.button("↓", key=f"scn_down_{i}", help="Lower priority") and i < len(st.session_state.scenarios)-1:
+                                st.session_state.scenarios[i+1], st.session_state.scenarios[i] = st.session_state.scenarios[i], st.session_state.scenarios[i+1]
+                        with btn_c3:
+                            if st.button("Duplicate", key=f"scn_dup_{i}"):
+                                dup = scn.copy(); dup["name"] = f"{dup['name']} (copy)"; st.session_state.scenarios.append(dup)
+                        with btn_c4:
+                            if st.button("Delete", key=f"scn_del_{i}"):
+                                st.session_state.scenarios.pop(i); st.experimental_rerun()
+        # Impact & Compare full width
+        st.markdown("#### Impact & Compare")
+        forecast_idx = st.session_state.results["forecast"].index
+        components = {}
+        overlay = None
+        adjusted = None
+        if st.session_state.apply_scenarios and any(s.get("active", True) for s in st.session_state.scenarios):
+            components = compute_planned_components(st.session_state.scenarios, forecast_idx)
+            overlay = sum_components(components)
+            if overlay is not None and len(overlay):
+                # For scenario analysis, adjustments must reflect the physical addition
+                # of load without policy clamps. We therefore do NOT bound the
+                # adjusted series to RJPP here (clamp_to_rjpp=False). This ensures a
+                # 100 MW scenario peak truly adds ~100 MW to the corresponding
+                # months in the adjusted p50/Ensemble, matching the stacked overlay.
+                rjpp_series = (
+                    st.session_state.results["forecast"].get("RJPP")
+                    if "RJPP" in st.session_state.results["forecast"].columns
+                    else None
+                )
+                adjusted = apply_scenarios_to_bands(
+                    st.session_state.results["forecast"],
+                    overlay,
+                    rjpp_series,
+                    st.session_state.forecaster.max_dev,
+                    clamp_to_rjpp=False,
+                )
+        if not st.session_state.apply_scenarios:
+            st.info("Scenarios not applied. Toggle 'Apply scenarios to forecast' above.")
+        elif not any(s.get("active", True) for s in st.session_state.scenarios):
+            st.warning("No active scenarios. Activate at least one in the library.")
+        # Charts
+        if components:
+            fig_overlay = plot_stacked_overlay(components, st.session_state.results["forecast"], adjusted)
+            st.plotly_chart(fig_overlay, use_container_width=True)
+        st.markdown("#### Scenario comparison")
+        base_forecast = st.session_state.results["forecast"]
+        combined_series = st.session_state.combined
+        rjpp_full_local = st.session_state.rjpp_full if st.session_state.rjpp_full is not None else None
+        if isinstance(combined_series, pd.Series):
+            combined_frame = combined_series.to_frame(name="Combined")
+        elif isinstance(combined_series, pd.DataFrame):
+            combined_frame = combined_series
+        else:
+            combined_frame = pd.DataFrame()
+        col_base, col_adjusted = st.columns(2)
+        with col_base:
+            st.markdown("**Base forecast**")
             plot_hero(
-                combined_adjusted_frame,
+                combined_frame,
                 base_forecast,
                 rjpp_full_local,
-                key_suffix="scenario_adjusted",
+                key_suffix="scenario_base",
                 show_bands=show_bands,
                 bounded=bounded_bands,
                 max_dev=forecaster.max_dev,
-                fc_adj=adjusted,
-                combined_adj=combined_adjusted,
-                planned_overlay=overlay,
                 forecast_start=forecast_start_ts,
             )
-        else:
-            st.info("Activate scenarios to see adjusted forecast impacts.")
-    # KPI tiles
-    kpi_cols = st.columns(4)
-    kpis = compute_kpis(st.session_state.results["forecast"], adjusted, st.session_state.rjpp_full if st.session_state.rjpp_full is not None else None)
-    show_metric(kpi_cols[0], "ΔPeak (MW)", f"{kpis.get('delta_peak_mw', float('nan')):,.0f}" if np.isfinite(kpis.get('delta_peak_mw', np.nan)) else "n/a")
-    show_metric(kpi_cols[1], "ΔAvg 12m (MW)", f"{kpis.get('delta_avg_mw', float('nan')):,.1f}" if np.isfinite(kpis.get('delta_avg_mw', np.nan)) else "n/a")
-    show_metric(kpi_cols[2], "ΔAvg 12m (%)", f"{kpis.get('delta_avg_pct', float('nan')):,.2f}%" if np.isfinite(kpis.get('delta_avg_pct', np.nan)) else "n/a")
-    if np.isfinite(kpis.get("rjpp_delta_pp", np.nan)):
-        show_metric(kpi_cols[3], "RJPP Δ (pp)", f"{kpis['rjpp_delta_pp']:.2f}pp")
-    # Annual impact bars
-    if adjusted is not None:
-        st.plotly_chart(plot_annual_impact(adjusted, st.session_state.results["forecast"]), use_container_width=True)
-    # Export active scenarios overlay and components
-    if overlay is not None and len(overlay):
-        stub = pd.DataFrame({"Date": overlay.index, "Planned_MW": overlay.values})
-        st.download_button(
-            "Scenario overlay CSV",
-            stub.to_csv(index=False),
-            "scenario_overlay.csv",
-            "text/csv",
-        )
-        # Components CSV (each active scenario as a column + overlay)
-        try:
-            comp_df = pd.DataFrame(index=overlay.index)
-            for name, s in (components or {}).items():
-                comp_df[name] = s.reindex(overlay.index).astype(float)
-            comp_df["Overlay"] = overlay.astype(float)
-            comp_df_reset = comp_df.reset_index().rename(columns={comp_df.index.name or 'index': 'Date'})
+        with col_adjusted:
+            st.markdown("**Scenario-adjusted**")
+            if adjusted is not None:
+                combined_adjusted = st.session_state.combined_adjusted if st.session_state.combined_adjusted is not None else combined_series
+                if isinstance(combined_adjusted, pd.Series):
+                    combined_adjusted_frame = combined_adjusted.to_frame(name="Combined")
+                elif isinstance(combined_adjusted, pd.DataFrame):
+                    combined_adjusted_frame = combined_adjusted
+                else:
+                    combined_adjusted_frame = combined_frame
+                plot_hero(
+                    combined_adjusted_frame,
+                    base_forecast,
+                    rjpp_full_local,
+                    key_suffix="scenario_adjusted",
+                    show_bands=show_bands,
+                    bounded=bounded_bands,
+                    max_dev=forecaster.max_dev,
+                    fc_adj=adjusted,
+                    combined_adj=combined_adjusted,
+                    planned_overlay=overlay,
+                    forecast_start=forecast_start_ts,
+                )
+            else:
+                st.info("Activate scenarios to see adjusted forecast impacts.")
+        # KPI tiles
+        kpi_cols = st.columns(4)
+        kpis = compute_kpis(st.session_state.results["forecast"], adjusted, st.session_state.rjpp_full if st.session_state.rjpp_full is not None else None)
+        show_metric(kpi_cols[0], "ΔPeak (MW)", f"{kpis.get('delta_peak_mw', float('nan')):,.0f}" if np.isfinite(kpis.get('delta_peak_mw', np.nan)) else "n/a")
+        show_metric(kpi_cols[1], "ΔAvg 12m (MW)", f"{kpis.get('delta_avg_mw', float('nan')):,.1f}" if np.isfinite(kpis.get('delta_avg_mw', np.nan)) else "n/a")
+        show_metric(kpi_cols[2], "ΔAvg 12m (%)", f"{kpis.get('delta_avg_pct', float('nan')):,.2f}%" if np.isfinite(kpis.get('delta_avg_pct', np.nan)) else "n/a")
+        if np.isfinite(kpis.get("rjpp_delta_pp", np.nan)):
+            show_metric(kpi_cols[3], "RJPP Δ (pp)", f"{kpis['rjpp_delta_pp']:.2f}pp")
+        elif has_rjpp and not rjpp_has_reference:
+            show_metric(kpi_cols[3], "RJPP Δ (pp)", "n/a")
+            st.caption("RJPP compliance deltas are unavailable because the RJPP file does not cover the selected forecast horizon.")
+        # Annual impact bars
+        if adjusted is not None:
+            st.plotly_chart(plot_annual_impact(adjusted, st.session_state.results["forecast"]), use_container_width=True)
+        # Export active scenarios overlay and components
+        if overlay is not None and len(overlay):
+            stub = pd.DataFrame({"Date": overlay.index, "Planned_MW": overlay.values})
             st.download_button(
-                "Scenario components CSV",
-                comp_df_reset.to_csv(index=False),
-                "scenario_components.csv",
+                "Scenario overlay CSV",
+                stub.to_csv(index=False),
+                "scenario_overlay.csv",
                 "text/csv",
             )
-        except Exception:
-            pass
-    # Import/Export scenarios (JSON)
-    with st.expander("Import / Export Scenarios", expanded=False):
-        c1, c2 = st.columns([1,1])
-        with c1:
+            # Components CSV (each active scenario as a column + overlay)
             try:
-                def _clean_for_export(s: dict) -> dict:
-                    # drop transient/internal keys
-                    return {k: v for k, v in s.items() if not str(k).startswith('_')}
-                export_payload = json.dumps([_clean_for_export(s) for s in st.session_state.scenarios], indent=2)
+                comp_df = pd.DataFrame(index=overlay.index)
+                for name, s in (components or {}).items():
+                    comp_df[name] = s.reindex(overlay.index).astype(float)
+                comp_df["Overlay"] = overlay.astype(float)
+                comp_df_reset = comp_df.reset_index().rename(columns={comp_df.index.name or 'index': 'Date'})
                 st.download_button(
-                    "Export scenarios JSON",
-                    export_payload,
-                    "scenarios.json",
-                    "application/json",
+                    "Scenario components CSV",
+                    comp_df_reset.to_csv(index=False),
+                    "scenario_components.csv",
+                    "text/csv",
                 )
             except Exception:
-                st.caption("No scenarios to export.")
-        with c2:
-            up = st.file_uploader("Import scenarios JSON", type=["json"], key="scn_import")
-            if up is not None:
+                pass
+        # Import/Export scenarios (JSON)
+        with st.expander("Import / Export Scenarios", expanded=False):
+            c1, c2 = st.columns([1,1])
+            with c1:
                 try:
-                    data = json.load(up)
-                    if isinstance(data, dict):
-                        data = data.get("scenarios", [])
-                    added = 0
-                    for rec in data if isinstance(data, list) else []:
-                        if not isinstance(rec, dict):
-                            continue
-                        errs = validate_scenario_dict(rec)
-                        if errs:
-                            continue
-                        st.session_state.scenarios.append(rec)
-                        added += 1
-                    if added:
-                        st.success(f"Imported {added} scenarios.")
-                        st.experimental_rerun()
-                    else:
-                        st.info("No valid scenarios found in file.")
-                except Exception as e:
-                    st.error(f"Import failed: {e}")
+                    def _clean_for_export(s: dict) -> dict:
+                        # drop transient/internal keys
+                        return {k: v for k, v in s.items() if not str(k).startswith('_')}
+                    export_payload = json.dumps([_clean_for_export(s) for s in st.session_state.scenarios], indent=2)
+                    st.download_button(
+                        "Export scenarios JSON",
+                        export_payload,
+                        "scenarios.json",
+                        "application/json",
+                    )
+                except Exception:
+                    st.caption("No scenarios to export.")
+            with c2:
+                up = st.file_uploader("Import scenarios JSON", type=["json"], key="scn_import")
+                if up is not None:
+                    try:
+                        data = json.load(up)
+                        if isinstance(data, dict):
+                            data = data.get("scenarios", [])
+                        added = 0
+                        for rec in data if isinstance(data, list) else []:
+                            if not isinstance(rec, dict):
+                                continue
+                            errs = validate_scenario_dict(rec)
+                            if errs:
+                                continue
+                            st.session_state.scenarios.append(rec)
+                            added += 1
+                        if added:
+                            st.success(f"Imported {added} scenarios.")
+                            st.experimental_rerun()
+                        else:
+                            st.info("No valid scenarios found in file.")
+                    except Exception as e:
+                        st.error(f"Import failed: {e}")
 
-with tab_scenarios:
-    ui_scenarios_tab()
+    with tab_scenarios:
+        ui_scenarios_tab()
 
-# Prefer module-level AI functions if available (override local stubs)
-try:
-    if 'ai_mod' in globals() and ai_mod is not None:
-        ollama_analyze = ai_mod.ollama_analyze  # type: ignore
-        build_analysis_payload = ai_mod.build_analysis_payload  # type: ignore
-except Exception:
-    pass
-
-# ---------- AI Insights ----------
-with tab_ai:
-    # --- AI Insight (chat) ---
-    st.subheader("AI Insight")
-    if st.session_state.pop("ai_focus_banner", False):
-        st.info("Quick action triggered. Scroll here to prompt the AI assistant below.")
-
-    # Optional imports from ai_insights; guard to avoid hard failures
+    # Prefer module-level AI functions if available (override local stubs)
     try:
-        from ai_insights import (
-            build_chat_facts as _build_chat_facts_mod,
-            ollama_chat as _ollama_chat_mod,
-            build_peak_trend_payload as _build_peak_trend_payload_mod,
-            ollama_analyze_narrative as _ollama_analyze_narrative_mod,
-        )
+        if 'ai_mod' in globals() and ai_mod is not None:
+            ollama_analyze = ai_mod.ollama_analyze  # type: ignore
+            build_analysis_payload = ai_mod.build_analysis_payload  # type: ignore
     except Exception:
-        _build_chat_facts_mod = None
-        _ollama_chat_mod = None
-        _build_peak_trend_payload_mod = None
-        _ollama_analyze_narrative_mod = None
+        pass
 
-    # Utilities for local fallbacks
-    def _list_ollama_models_local() -> list[str]:
+    # ---------- AI Insights ----------
+    with tab_ai:
+        # --- AI Insight (chat) ---
+        st.subheader("AI Insight")
+        if st.session_state.pop("ai_focus_banner", False):
+            st.info("Quick action triggered. Scroll here to prompt the AI assistant below.")
+
+        # Optional imports from ai_insights; guard to avoid hard failures
         try:
-            import json, urllib.request
-            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                items = data.get("models", []) or []
-                return [m.get("name") for m in items if isinstance(m, dict) and m.get("name")]
+            from ai_insights import (
+                build_chat_facts as _build_chat_facts_mod,
+                ollama_chat as _ollama_chat_mod,
+                build_peak_trend_payload as _build_peak_trend_payload_mod,
+                ollama_analyze_narrative as _ollama_analyze_narrative_mod,
+            )
         except Exception:
-            return ["qwen3:8b", "deepseek-r1:8b", "llama3.2:3b"]
+            _build_chat_facts_mod = None
+            _ollama_chat_mod = None
+            _build_peak_trend_payload_mod = None
+            _ollama_analyze_narrative_mod = None
 
-    def _ollama_chat_local(model: str, question: str, facts: dict, temperature: float = 0.1, num_predict: int = 450, num_ctx: int = 2048, timeout_s: int = 180) -> str:
-        try:
-            import json, urllib.request
-            
-            # Extract key metrics and convert to natural language facts
-            meta = facts.get("meta", {})
-            next12 = facts.get("next_12m", {})
-            planning = facts.get("planning", {})
-            validation = facts.get("validation", {})
-            peaks = facts.get("peaks", {})
-            uncertainty = facts.get("uncertainty", {})
-            annual = facts.get("annual", {})
-            weights = facts.get("weights", {})
-            history = facts.get("history", {})
-            scenarios = facts.get("scenarios", [])
-            
-            # Build comprehensive natural language context
-            facts_narrative = []
-            
-            # Historical context
-            if history.get("last_actual_mw"):
-                facts_narrative.append(f"Current actual load is {history['last_actual_mw']:.1f} MW.")
-            if history.get("last_12m_avg_mw"):
-                facts_narrative.append(f"The last 12 months averaged {history['last_12m_avg_mw']:.1f} MW with total energy of {history.get('last_12m_energy_gwh', 0):.1f} GWh.")
-            
-            # Forecast period
-            if meta.get("forecast_start") and meta.get("forecast_end"):
-                facts_narrative.append(f"The forecast covers {meta['months']} months from {meta['forecast_start']} to {meta['forecast_end']}.")
-            
-            # Growth trend
-            if meta.get("cagr_pct_per_year") is not None:
-                cagr = meta['cagr_pct_per_year']
-                trend_word = "growing" if cagr > 0 else ("declining" if cagr < 0 else "stable")
-                facts_narrative.append(f"Overall demand is {trend_word} at {abs(cagr):.2f}% per year (CAGR).")
-            
-            # Next 12 months key metrics
-            if next12.get("avg_mw") and next12.get("peak_mw") and next12.get("peak_month"):
-                facts_narrative.append(f"In the next 12 months, average demand will be {next12['avg_mw']:.1f} MW, with a peak of {next12['peak_mw']:.1f} MW expected in {next12['peak_month']}.")
-                if next12.get("energy_gwh"):
-                    facts_narrative.append(f"Total energy consumption for the next 12 months is projected at {next12['energy_gwh']:.1f} GWh.")
-            
-            # Top peaks
-            if peaks.get("top3") and len(peaks["top3"]) > 0:
-                peak_list = ", ".join([f"{pk['month']} ({pk['mw']:.1f} MW)" for pk in peaks["top3"][:3]])
-                facts_narrative.append(f"The three highest peak months are: {peak_list}.")
-            
-            # Model ensemble information
-            if weights:
-                top_models = sorted(weights.items(), key=lambda x: x[1], reverse=True)[:3]
-                model_desc = ", ".join([f"{m} ({w*100:.1f}%)" for m, w in top_models])
-                facts_narrative.append(f"The forecast uses an ensemble of models weighted as: {model_desc}.")
-            
-            # Uncertainty bands
-            if uncertainty.get("avg_band_width_mw") and uncertainty.get("max_band_width_mw"):
-                facts_narrative.append(f"Forecast uncertainty: average band width is {uncertainty['avg_band_width_mw']:.1f} MW, with maximum reaching {uncertainty['max_band_width_mw']:.1f} MW.")
-            
-            # Validation performance
-            if validation.get("band_calibration_pct"):
-                facts_narrative.append(f"Model validation shows {validation['band_calibration_pct']:.1f}% of historical months fall within the p10-p90 uncertainty bands.")
-            
-            # RJPP compliance
-            if planning.get("rjpp_compliance_pct"):
-                facts_narrative.append(f"RJPP regulatory compliance: {planning['rjpp_compliance_pct']:.1f}% of forecast months are within {meta.get('max_dev_pct', 5):.1f}% deviation from regulatory baseline.")
-            
-            # Planning reserve analysis
-            if planning.get("avg_monthly_shortfall_mw_vs_p90_prm"):
-                prm = planning.get("assumed_prm_pct", 15)
-                shortfall = planning['avg_monthly_shortfall_mw_vs_p90_prm']
-                if shortfall > 0:
-                    facts_narrative.append(f"Capacity planning: assuming {prm:.0f}% planning reserve margin, average monthly shortfall vs. p90 demand is {shortfall:.1f} MW.")
-            
-            # Annual breakdown (first 3-5 years)
-            if annual:
-                years_to_show = sorted(annual.keys())[:5]
-                facts_narrative.append(f"Annual projections for the next {len(years_to_show)} years:")
-                for year in years_to_show:
-                    yr_data = annual[year]
-                    facts_narrative.append(f"  - {year}: Average demand {yr_data.get('avg_mw', 0):.1f} MW, peak {yr_data.get('peak_mw', 0):.1f} MW, total energy {yr_data.get('energy_gwh', 0):.1f} GWh.")
-            
-            # Scenarios summary
-            if scenarios and len(scenarios) > 0:
-                active_scenarios = [s for s in scenarios if s.get('active', True)]
-                if active_scenarios:
-                    total_capacity = sum(s.get('capacity_mw', 0) or s.get('mw', 0) for s in active_scenarios)
-                    facts_narrative.append(f"There are {len(active_scenarios)} active scenarios adding {total_capacity:.1f} MW of capacity.")
-                    top_scenarios = sorted(active_scenarios, key=lambda s: s.get('capacity_mw', 0) or s.get('mw', 0), reverse=True)[:3]
-                    for scn in top_scenarios:
-                        name = scn.get('name', 'Unnamed')
-                        cap = scn.get('capacity_mw', 0) or scn.get('mw', 0)
-                        start = scn.get('start_month', 'TBD')
-                        facts_narrative.append(f"  - {name}: {cap:.1f} MW starting {start}")
-
-            # Scenario-adjusted forecast deltas (compare adjusted vs. base)
+        # Utilities for local fallbacks
+        def _list_ollama_models_local() -> list[str]:
             try:
-                base_series = (facts.get("series", {}) or {}).get("p50", []) or []
-                adj_series = (facts.get("adjusted", {}) or {}).get("p50_adj", []) or []
-                if base_series and adj_series:
-                    base_map = {
-                        item.get("date"): float(item.get("mw"))
-                        for item in base_series
-                        if isinstance(item, dict) and item.get("date") and item.get("mw") is not None
-                    }
-                    deltas: list[tuple[str, float, float, float]] = []
-                    for item in adj_series:
-                        if not isinstance(item, dict):
-                            continue
-                        date = item.get("date")
-                        adj_val = item.get("mw")
-                        base_val = base_map.get(date)
-                        if date is None or adj_val is None or base_val is None:
-                            continue
-                        delta = float(adj_val) - float(base_val)
-                        if abs(delta) < 1e-5:
-                            continue
-                        deltas.append((date, delta, float(base_val), float(adj_val)))
-                    if deltas:
-                        # Keep chronological order (series already ordered)
-                        next_12 = deltas[:12]
-                        total_delta_12 = sum(d[1] for d in next_12) if next_12 else 0.0
-                        avg_delta_12 = (total_delta_12 / len(next_12)) if next_12 else 0.0
-                        largest_delta = max(deltas, key=lambda x: abs(x[1]))
-                        direction_word = "increase" if total_delta_12 >= 0 else "decrease"
-                        facts_narrative.append(
-                            f"Scenario adjustments {direction_word} the forecast by {total_delta_12:+.1f} MW across the next 12 months "
-                            f"(average shift {avg_delta_12:+.1f} MW). Largest change is {largest_delta[1]:+.1f} MW in {largest_delta[0]}, "
-                            f"moving from {largest_delta[2]:.1f} MW to {largest_delta[3]:.1f} MW."
-                        )
-                        first_material = next((d for d in deltas if abs(d[1]) >= 0.5), None)
-                        if first_material:
-                            facts_narrative.append(
-                                f"First material divergence occurs in {first_material[0]} at {first_material[1]:+.1f} MW vs. base."
-                            )
+                import json, urllib.request
+                req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    items = data.get("models", []) or []
+                    return [m.get("name") for m in items if isinstance(m, dict) and m.get("name")]
             except Exception:
-                pass
+                return ["qwen3:8b", "deepseek-r1:8b", "llama3.2:3b"]
+
+        def _ollama_chat_local(model: str, question: str, facts: dict, temperature: float = 0.1, num_predict: int = 450, num_ctx: int = 2048, timeout_s: int = 180) -> str:
+            try:
+                import json, urllib.request
             
-            # Combine all facts into a readable narrative
-            facts_text = "\n".join(facts_narrative)
+                # Extract key metrics and convert to natural language facts
+                meta = facts.get("meta", {})
+                next12 = facts.get("next_12m", {})
+                planning = facts.get("planning", {})
+                validation = facts.get("validation", {})
+                peaks = facts.get("peaks", {})
+                uncertainty = facts.get("uncertainty", {})
+                annual = facts.get("annual", {})
+                weights = facts.get("weights", {})
+                history = facts.get("history", {})
+                scenarios = facts.get("scenarios", [])
             
-            # Create a professional system prompt that acts as a consultant
-            system = (
-                "You are a Senior Power Systems Planning Engineer with 20+ years of experience. "
-                "You have just completed a detailed load forecast analysis and are now briefing the utility's planning committee.\n\n"
-                "Your role is to:\n"
-                "- Interpret the forecast results and provide actionable insights\n"
-                "- Highlight critical findings, risks, and opportunities\n"
-                "- Make specific recommendations with numbers, months, and magnitudes\n"
-                "- Write in a professional, consultant-style narrative\n\n"
-                "DO NOT describe data structures or JSON formats. "
-                "DO NOT explain what the analysis contains. "
-                "Instead, USE the data to tell a story about what the forecast reveals and what actions should be taken.\n\n"
-                "CRITICAL RULES:\n"
-                "1. Write as if speaking to executives - focus on business impact\n"
-                "2. Use specific numbers, months (YYYY-MM format), and MW/GWh units\n"
-                "3. Be concise but substantive - every sentence should add value\n"
-                "4. Focus on actionable insights, not data description\n"
-                "5. Never say 'the data shows' or 'according to the JSON' - just state the findings directly\n"
-            )
+                # Build comprehensive natural language context
+                facts_narrative = []
             
-            # Decide response style based on whether user kept the default template
-            def _normalize_prompt_text(text: str) -> str:
-                return "\n".join(line.strip() for line in text.strip().splitlines() if line.strip()) if text else ""
-
-            normalized_question = _normalize_prompt_text(question or "")
-            normalized_default = _normalize_prompt_text(DEFAULT_AI_QUERY or "")
-            use_structured_summary = bool(normalized_question) and normalized_question == normalized_default
-
-            if use_structured_summary:
-                task = (
-                    "Based on the forecast analysis, craft a concise briefing using this structure:\n\n"
-                    "## Summary\n"
-                    "3-5 bullets on the most critical findings (peak demands, growth trends, compliance status)\n\n"
-                    "## Key Risks & Concerns\n"
-                    "Highlight 3-4 specific risks (capacity shortfalls, compliance issues, uncertainty factors)\n\n"
-                    "## Recommendations\n"
-                    "List 4-6 concrete action items (capacity additions, monitoring priorities, scenario analysis)\n\n"
-                    "Write professionally and confidently. Be specific with numbers, timeframes, and units."
-                )
-            else:
-                task = (
-                    "Using the context above, answer the user's question directly. "
-                    "Cite specific months (YYYY-MM), MW / GWh values, and scenario-adjusted impacts when relevant. "
-                    "If information is unavailable, state 'n/a' rather than guessing."
-                )
+                # Historical context
+                if history.get("last_actual_mw"):
+                    facts_narrative.append(f"Current actual load is {history['last_actual_mw']:.1f} MW.")
+                if history.get("last_12m_avg_mw"):
+                    facts_narrative.append(f"The last 12 months averaged {history['last_12m_avg_mw']:.1f} MW with total energy of {history.get('last_12m_energy_gwh', 0):.1f} GWh.")
             
-            question_clean = (question or "").strip()
+                # Forecast period
+                if meta.get("forecast_start") and meta.get("forecast_end"):
+                    facts_narrative.append(f"The forecast covers {meta['months']} months from {meta['forecast_start']} to {meta['forecast_end']}.")
+            
+                # Growth trend
+                if meta.get("cagr_pct_per_year") is not None:
+                    cagr = meta['cagr_pct_per_year']
+                    trend_word = "growing" if cagr > 0 else ("declining" if cagr < 0 else "stable")
+                    facts_narrative.append(f"Overall demand is {trend_word} at {abs(cagr):.2f}% per year (CAGR).")
+            
+                # Next 12 months key metrics
+                if next12.get("avg_mw") and next12.get("peak_mw") and next12.get("peak_month"):
+                    facts_narrative.append(f"In the next 12 months, average demand will be {next12['avg_mw']:.1f} MW, with a peak of {next12['peak_mw']:.1f} MW expected in {next12['peak_month']}.")
+                    if next12.get("energy_gwh"):
+                        facts_narrative.append(f"Total energy consumption for the next 12 months is projected at {next12['energy_gwh']:.1f} GWh.")
+            
+                # Top peaks
+                if peaks.get("top3") and len(peaks["top3"]) > 0:
+                    peak_list = ", ".join([f"{pk['month']} ({pk['mw']:.1f} MW)" for pk in peaks["top3"][:3]])
+                    facts_narrative.append(f"The three highest peak months are: {peak_list}.")
+            
+                # Model ensemble information
+                if weights:
+                    top_models = sorted(weights.items(), key=lambda x: x[1], reverse=True)[:3]
+                    model_desc = ", ".join([f"{m} ({w*100:.1f}%)" for m, w in top_models])
+                    facts_narrative.append(f"The forecast uses an ensemble of models weighted as: {model_desc}.")
+            
+                # Uncertainty bands
+                if uncertainty.get("avg_band_width_mw") and uncertainty.get("max_band_width_mw"):
+                    facts_narrative.append(f"Forecast uncertainty: average band width is {uncertainty['avg_band_width_mw']:.1f} MW, with maximum reaching {uncertainty['max_band_width_mw']:.1f} MW.")
+            
+                # Validation performance
+                if validation.get("band_calibration_pct"):
+                    facts_narrative.append(f"Model validation shows {validation['band_calibration_pct']:.1f}% of historical months fall within the p10-p90 uncertainty bands.")
+            
+                # RJPP compliance
+                if planning.get("rjpp_compliance_pct"):
+                    facts_narrative.append(f"RJPP regulatory compliance: {planning['rjpp_compliance_pct']:.1f}% of forecast months are within {meta.get('max_dev_pct', 5):.1f}% deviation from regulatory baseline.")
+            
+                # Planning reserve analysis
+                if planning.get("avg_monthly_shortfall_mw_vs_p90_prm"):
+                    prm = planning.get("assumed_prm_pct", 15)
+                    shortfall = planning['avg_monthly_shortfall_mw_vs_p90_prm']
+                    if shortfall > 0:
+                        facts_narrative.append(f"Capacity planning: assuming {prm:.0f}% planning reserve margin, average monthly shortfall vs. p90 demand is {shortfall:.1f} MW.")
+            
+                # Annual breakdown (first 3-5 years)
+                if annual:
+                    years_to_show = sorted(annual.keys())[:5]
+                    facts_narrative.append(f"Annual projections for the next {len(years_to_show)} years:")
+                    for year in years_to_show:
+                        yr_data = annual[year]
+                        facts_narrative.append(f"  - {year}: Average demand {yr_data.get('avg_mw', 0):.1f} MW, peak {yr_data.get('peak_mw', 0):.1f} MW, total energy {yr_data.get('energy_gwh', 0):.1f} GWh.")
+            
+                # Scenarios summary
+                if scenarios and len(scenarios) > 0:
+                    active_scenarios = [s for s in scenarios if s.get('active', True)]
+                    if active_scenarios:
+                        total_capacity = sum(s.get('capacity_mw', 0) or s.get('mw', 0) for s in active_scenarios)
+                        facts_narrative.append(f"There are {len(active_scenarios)} active scenarios adding {total_capacity:.1f} MW of capacity.")
+                        top_scenarios = sorted(active_scenarios, key=lambda s: s.get('capacity_mw', 0) or s.get('mw', 0), reverse=True)[:3]
+                        for scn in top_scenarios:
+                            name = scn.get('name', 'Unnamed')
+                            cap = scn.get('capacity_mw', 0) or scn.get('mw', 0)
+                            start = scn.get('start_month', 'TBD')
+                            facts_narrative.append(f"  - {name}: {cap:.1f} MW starting {start}")
 
-            # The actual prompt - facts as narrative, not JSON
-            prompt = (
-                f"{system}\n\n"
-                f"=== FORECAST ANALYSIS RESULTS ===\n\n"
-                f"{facts_text}\n\n"
-                f"=== END OF ANALYSIS DATA ===\n\n"
-                f"{task}\n\n"
-                f"User question: {question_clean or 'Provide a structured summary of the forecast.'}\n\n"
-                f"Provide your expert analysis now:"
-            )
-            body = json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": float(temperature),
-                    "num_predict": int(num_predict),
-                    "num_ctx": int(num_ctx),
-                    "top_p": 0.9,
-                    "top_k": 40,
-                    "stop": ["</think>"]
-                },
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                "http://localhost:11434/api/generate",
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data.get("response", "")
-        except Exception as e:
-            return f"AI call failed: {e}"
-
-    # Build comprehensive, tidy facts payload (fallback or augmentation)
-    def _build_chat_facts_tidy(results: dict, scenarios: list, *, compact: bool = True, max_months: int = 24, top_features: int = 8, prm_pct: float = 0.15) -> dict:
-        out: dict[str, object] = {"error": None}
-        try:
-            fc: pd.DataFrame | None = results.get("forecast") if isinstance(results, dict) else None
-            if fc is None or fc.empty:
-                return {"error": "no_forecast"}
-            base_col = "p50" if "p50" in fc.columns else "Ensemble"
-            start = fc.index.min().strftime("%Y-%m")
-            end = fc.index.max().strftime("%Y-%m")
-            out["context"] = {
-                "units": {"power": "MW", "energy": "GWh"},
-                "interval": "monthly",
-                "definitions": {
-                    "p50": "Median monthly load forecast (MW)",
-                    "p10": "Lower uncertainty bound (10th percentile, MW)",
-                    "p90": "Upper uncertainty bound (90th percentile, MW)",
-                    "RJPP": "Regulatory baseline monthly load (MW)",
-                    "band_calibration": "Share of validation months within p10–p90",
-                    "RJPP_compliance": "Share of months within RJPP ± bound",
-                },
-            }
-            # Add headline meta and trend
-            cagr = None
-            try:
-                cagr = _calc_cagr_series(fc[base_col])
-            except Exception:
-                cagr = None
-            out["meta"] = {
-                "forecast_start": start,
-                "forecast_end": end,
-                "ensemble_method": results.get("ensemble_choice"),
-                "band_k": float(getattr(st.session_state.forecaster, "band_k", 1.0)),
-                "max_dev_pct": float(results.get("max_dev", getattr(st.session_state.forecaster, "max_dev", 0.05)) * 100.0),
-                "months": int(len(fc.index)),
-                "cagr_pct_per_year": float(cagr * 100.0) if cagr is not None else None,
-            }
-            # Series (trim to last max_months when compact)
-            def _series(df: pd.DataFrame, col: str) -> list[dict]:
-                if col not in df.columns:
-                    return []
-                s = df[col].astype(float)
-                if compact and isinstance(max_months, int) and max_months > 0:
-                    s = s.iloc[-max_months:]
-                return [{"date": d.strftime("%Y-%m"), "mw": float(v)} for d, v in s.items()]
-            out["series"] = {
-                "p50": _series(fc, base_col),
-                "p10": _series(fc, "p10"),
-                "p90": _series(fc, "p90"),
-                "rjpp": _series(fc, "RJPP") if "RJPP" in fc.columns else [],
-            }
-            # History snapshot
-            try:
-                comb = results.get("combined_forecast")
-                if isinstance(comb, pd.DataFrame) and "Combined" in comb.columns:
-                    hist_end = fc.index.min() - pd.offsets.MonthBegin(1)
-                    hist = comb["Combined"].loc[:hist_end].dropna()
-                    last_actual = float(hist.iloc[-1]) if len(hist) else None
-                    hist12 = hist.tail(12)
-                    out["history"] = {
-                        "last_actual_mw": last_actual,
-                        "last_12m_avg_mw": float(hist12.mean()) if len(hist12) else None,
-                        "last_12m_energy_gwh": float((hist12 * pd.Series(hist12.index.days_in_month, index=hist12.index) * 24).sum() / 1000) if len(hist12) else None,
-                    }
-            except Exception:
-                out["history"] = {}
-
-            # Next 12 months summary
-            try:
-                nxt = fc[base_col].astype(float).iloc[:12]
-                hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float).iloc[:12] * 24
-                out["next_12m"] = {
-                    "avg_mw": float(nxt.mean()) if len(nxt) else None,
-                    "energy_gwh": float((nxt * hours).sum() / 1000) if len(nxt) else None,
-                    "peak_mw": float(nxt.max()) if len(nxt) else None,
-                    "peak_month": nxt.idxmax().strftime("%Y-%m") if len(nxt) else None,
-                }
-            except Exception:
-                out["next_12m"] = {}
-
-            # Peaks and uncertainty
-            try:
-                p50s = fc[base_col].astype(float)
-                p10s = fc["p10"].astype(float) if "p10" in fc.columns else None
-                p90s = fc["p90"].astype(float) if "p90" in fc.columns else None
-                top_idx = p50s.nlargest(3).index if len(p50s) else []
-                out["peaks"] = {
-                    "top3": [
-                        {"month": i.strftime("%Y-%m"), "mw": float(p50s.loc[i])}
-                        for i in top_idx
-                    ]
-                }
-                if p10s is not None and p90s is not None:
-                    width = (p90s - p10s)
-                    out["uncertainty"] = {
-                        "avg_band_width_mw": float(width.mean()),
-                        "max_band_width_mw": float(width.max()),
-                    }
-            except Exception:
-                pass
-
-            # Planning + compliance
-            try:
-                out["planning"] = {"assumed_prm_pct": float(prm_pct * 100)}
-                if "RJPP" in fc.columns:
-                    r = fc["RJPP"].replace(0, np.nan)
-                    dev = ((fc[base_col] - r) / r).abs()
-                    comp = float((dev <= (out["meta"]["max_dev_pct"] / 100.0)).mean() * 100)
-                    out["planning"]["rjpp_compliance_pct"] = comp
-                    # Rough monthly reserve check vs p90 + PRM
-                    if "p90" in fc.columns:
-                        need = fc["p90"] * (1.0 + prm_pct)
-                        short = (need - fc[base_col]).clip(lower=0)
-                        out["planning"]["avg_monthly_shortfall_mw_vs_p90_prm"] = float(short.mean())
-            except Exception:
-                pass
-            # Validation & calibration
-            out["validation"] = {
-                "metrics_by_model": results.get("validation_results", {}),
-                "ensemble_val_metrics": results.get("ensemble_val_metrics", {}),
-                "band_calibration_pct": float(results.get("calibration_pct")) if results.get("calibration_pct") is not None else None,
-            }
-            # Annual summary
-            try:
-                hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float) * 24
-                energy_mwh = fc[base_col].astype(float) * hours
-                annual = pd.DataFrame({
-                    "avg_mw": fc[base_col].groupby(fc.index.year).mean().astype(float),
-                    "energy_gwh": (energy_mwh.groupby(fc.index.year).sum() / 1000).astype(float),
-                    "peak_mw": fc[base_col].groupby(fc.index.year).max().astype(float),
-                })
-                out["annual"] = {int(y): {k: float(v) for k, v in row.items()} for y, row in annual.iterrows()}
-            except Exception:
-                out["annual"] = {}
-            # Scenarios
-            fc_adj: pd.DataFrame | None = st.session_state.get("fc_adjusted")
-            if isinstance(fc_adj, pd.DataFrame) and not fc_adj.empty:
-                adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else ("Ensemble_adj" if "Ensemble_adj" in fc_adj.columns else None)
-                out["adjusted"] = {"p50_adj": _series(fc_adj, adj_col)} if adj_col else {}
-            else:
-                out["adjusted"] = {}
-            out["scenarios"] = [{k: v for k, v in s.items() if not str(k).startswith("_")} for s in (scenarios or [])]
-            # Weights & importance
-            out["weights"] = results.get("model_weights", {})
-            # Feature importance (top N per model if compact)
-            feat = results.get("feature_importance", {}) or {}
-            if compact and isinstance(feat, dict):
-                trimmed = {}
-                for m, d in feat.items():
-                    if isinstance(d, dict):
-                        top = sorted(d.items(), key=lambda kv: abs(kv[1]), reverse=True)[:max(1, int(top_features))]
-                        trimmed[m] = {k: float(v) for k, v in top}
-                out["feature_importance"] = trimmed
-            else:
-                out["feature_importance"] = feat
-            return out
-        except Exception:
-            return {"error": "build_failed"}
-
-    # Clean, defaulted AI (no UI toggles)
-    # Chat state
-    if "ai_chat_history" not in st.session_state:
-        st.session_state.ai_chat_history = []
-
-    # Subtle styling for a cleaner AI section
-    st.markdown(
-        """
-        <style>
-        .stMetric { border: 1px solid rgba(255,255,255,0.08); padding: 8px 10px; border-radius: 10px; }
-        .stTextArea textarea { font-size: 0.95rem; }
-        .stButton>button { height: 42px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Build compact facts once for AI context
-    results_for_ai = st.session_state.get("results", {})
-    scenarios_for_ai = st.session_state.get("scenarios", [])
-
-    # Show existing chat
-    for msg in st.session_state.ai_chat_history:
-        with st.chat_message("user" if msg["role"] == "user" else "assistant"):
-            st.markdown(msg["content"])
-
-    # Simple input
-    user_q = st.text_area("Your question to AI", value=DEFAULT_AI_QUERY, height=160)
-    colx1, colx2 = st.columns([1, 0.5])
-    ask_clicked = colx1.button("Ask AI", type="primary", use_container_width=True)
-    clear_clicked = colx2.button("Clear chat", use_container_width=True)
-
-    if clear_clicked:
-        st.session_state.ai_chat_history = []
-        st.rerun()
-
-    if ask_clicked and user_q.strip():
-        st.session_state.ai_chat_history.append({"role": "user", "content": user_q.strip()})
-        st.session_state.ai_chat_history = st.session_state.ai_chat_history[-20:]
-        with st.chat_message("assistant"):
-            status = st.status("Generating…", expanded=True)
-            with status:
-                status.write("Extracting forecast metrics...")
-                facts = _build_chat_facts_tidy(results_for_ai, scenarios_for_ai, compact=True, max_months=24, prm_pct=0.15)
-                model_opts = _list_ollama_models_local()
-                model = (model_opts[0] if model_opts else "llama3.2:3b")
-                status.write(f"Using AI model: {model}")
-                status.write("Building narrative context from forecast data...")
+                # Scenario-adjusted forecast deltas (compare adjusted vs. base)
                 try:
-                    # Increased num_predict for longer responses and num_ctx for better context understanding
-                    answer = _ollama_chat_local(model, user_q.strip(), facts, temperature=0.1, num_predict=800, num_ctx=4096, timeout_s=180)
-                except Exception as e:
-                    answer = f"AI call failed: {e}"
-                status.update(label="Answer received", state="complete")
-            final = sanitize_ai(answer)
-            st.markdown(final or "_No response._")
-        st.session_state.ai_chat_history.append({"role": "assistant", "content": final or ""})
+                    base_series = (facts.get("series", {}) or {}).get("p50", []) or []
+                    adj_series = (facts.get("adjusted", {}) or {}).get("p50_adj", []) or []
+                    if base_series and adj_series:
+                        base_map = {
+                            item.get("date"): float(item.get("mw"))
+                            for item in base_series
+                            if isinstance(item, dict) and item.get("date") and item.get("mw") is not None
+                        }
+                        deltas: list[tuple[str, float, float, float]] = []
+                        for item in adj_series:
+                            if not isinstance(item, dict):
+                                continue
+                            date = item.get("date")
+                            adj_val = item.get("mw")
+                            base_val = base_map.get(date)
+                            if date is None or adj_val is None or base_val is None:
+                                continue
+                            delta = float(adj_val) - float(base_val)
+                            if abs(delta) < 1e-5:
+                                continue
+                            deltas.append((date, delta, float(base_val), float(adj_val)))
+                        if deltas:
+                            # Keep chronological order (series already ordered)
+                            next_12 = deltas[:12]
+                            total_delta_12 = sum(d[1] for d in next_12) if next_12 else 0.0
+                            avg_delta_12 = (total_delta_12 / len(next_12)) if next_12 else 0.0
+                            largest_delta = max(deltas, key=lambda x: abs(x[1]))
+                            direction_word = "increase" if total_delta_12 >= 0 else "decrease"
+                            facts_narrative.append(
+                                f"Scenario adjustments {direction_word} the forecast by {total_delta_12:+.1f} MW across the next 12 months "
+                                f"(average shift {avg_delta_12:+.1f} MW). Largest change is {largest_delta[1]:+.1f} MW in {largest_delta[0]}, "
+                                f"moving from {largest_delta[2]:.1f} MW to {largest_delta[3]:.1f} MW."
+                            )
+                            first_material = next((d for d in deltas if abs(d[1]) >= 0.5), None)
+                            if first_material:
+                                facts_narrative.append(
+                                    f"First material divergence occurs in {first_material[0]} at {first_material[1]:+.1f} MW vs. base."
+                                )
+                except Exception:
+                    pass
+            
+                # Combine all facts into a readable narrative
+                facts_text = "\n".join(facts_narrative)
+            
+                # Create a professional system prompt that acts as a consultant
+                system = (
+                    "You are a Senior Power Systems Planning Engineer with 20+ years of experience. "
+                    "You have just completed a detailed load forecast analysis and are now briefing the utility's planning committee.\n\n"
+                    "Your role is to:\n"
+                    "- Interpret the forecast results and provide actionable insights\n"
+                    "- Highlight critical findings, risks, and opportunities\n"
+                    "- Make specific recommendations with numbers, months, and magnitudes\n"
+                    "- Write in a professional, consultant-style narrative\n\n"
+                    "DO NOT describe data structures or JSON formats. "
+                    "DO NOT explain what the analysis contains. "
+                    "Instead, USE the data to tell a story about what the forecast reveals and what actions should be taken.\n\n"
+                    "CRITICAL RULES:\n"
+                    "1. Write as if speaking to executives - focus on business impact\n"
+                    "2. Use specific numbers, months (YYYY-MM format), and MW/GWh units\n"
+                    "3. Be concise but substantive - every sentence should add value\n"
+                    "4. Focus on actionable insights, not data description\n"
+                    "5. Never say 'the data shows' or 'according to the JSON' - just state the findings directly\n"
+                )
+            
+                # Decide response style based on whether user kept the default template
+                def _normalize_prompt_text(text: str) -> str:
+                    return "\n".join(line.strip() for line in text.strip().splitlines() if line.strip()) if text else ""
 
-    # Transcript download
-    transcript_lines = []
-    for m in st.session_state.ai_chat_history:
-        who = "You" if m["role"] == "user" else "AI"
-        transcript_lines.append(f"**{who}:**\n\n{m['content']}\n")
-    st.download_button("Download transcript (.md)", "\n\n---\n\n".join(transcript_lines) or "", file_name="ai_insight_chat.md", mime="text/markdown", use_container_width=True)
+                normalized_question = _normalize_prompt_text(question or "")
+                normalized_default = _normalize_prompt_text(DEFAULT_AI_QUERY or "")
+                use_structured_summary = bool(normalized_question) and normalized_question == normalized_default
 
-    # Check if forecast is available
-    if not results_for_ai or not results_for_ai.get("forecast") is not None:
-        st.info("Run the forecast first to generate AI insights.")
+                if use_structured_summary:
+                    task = (
+                        "Based on the forecast analysis, craft a concise briefing using this structure:\n\n"
+                        "## Summary\n"
+                        "3-5 bullets on the most critical findings (peak demands, growth trends, compliance status)\n\n"
+                        "## Key Risks & Concerns\n"
+                        "Highlight 3-4 specific risks (capacity shortfalls, compliance issues, uncertainty factors)\n\n"
+                        "## Recommendations\n"
+                        "List 4-6 concrete action items (capacity additions, monitoring priorities, scenario analysis)\n\n"
+                        "Write professionally and confidently. Be specific with numbers, timeframes, and units."
+                    )
+                else:
+                    task = (
+                        "Using the context above, answer the user's question directly. "
+                        "Cite specific months (YYYY-MM), MW / GWh values, and scenario-adjusted impacts when relevant. "
+                        "If information is unavailable, state 'n/a' rather than guessing."
+                    )
+            
+                question_clean = (question or "").strip()
+
+                # The actual prompt - facts as narrative, not JSON
+                prompt = (
+                    f"{system}\n\n"
+                    f"=== FORECAST ANALYSIS RESULTS ===\n\n"
+                    f"{facts_text}\n\n"
+                    f"=== END OF ANALYSIS DATA ===\n\n"
+                    f"{task}\n\n"
+                    f"User question: {question_clean or 'Provide a structured summary of the forecast.'}\n\n"
+                    f"Provide your expert analysis now:"
+                )
+                body = json.dumps({
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": float(temperature),
+                        "num_predict": int(num_predict),
+                        "num_ctx": int(num_ctx),
+                        "top_p": 0.9,
+                        "top_k": 40,
+                        "stop": ["</think>"]
+                    },
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    "http://localhost:11434/api/generate",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return data.get("response", "")
+            except Exception as e:
+                return f"AI call failed: {e}"
+
+        # Build comprehensive, tidy facts payload (fallback or augmentation)
+        def _build_chat_facts_tidy(results: dict, scenarios: list, *, compact: bool = True, max_months: int = 24, top_features: int = 8, prm_pct: float = 0.15) -> dict:
+            out: dict[str, object] = {"error": None}
+            try:
+                fc: pd.DataFrame | None = results.get("forecast") if isinstance(results, dict) else None
+                if fc is None or fc.empty:
+                    return {"error": "no_forecast"}
+                base_col = "p50" if "p50" in fc.columns else "Ensemble"
+                start = fc.index.min().strftime("%Y-%m")
+                end = fc.index.max().strftime("%Y-%m")
+                out["context"] = {
+                    "units": {"power": "MW", "energy": "GWh"},
+                    "interval": "monthly",
+                    "definitions": {
+                        "p50": "Median monthly load forecast (MW)",
+                        "p10": "Lower uncertainty bound (10th percentile, MW)",
+                        "p90": "Upper uncertainty bound (90th percentile, MW)",
+                        "RJPP": "Regulatory baseline monthly load (MW)",
+                        "band_calibration": "Share of validation months within p10-90",
+                        "RJPP_compliance": "Share of months within RJPP ± bound",
+                    },
+                }
+                # Add headline meta and trend
+                cagr = None
+                try:
+                    cagr = _calc_cagr_series(fc[base_col])
+                except Exception:
+                    cagr = None
+                out["meta"] = {
+                    "forecast_start": start,
+                    "forecast_end": end,
+                    "ensemble_method": results.get("ensemble_choice"),
+                    "band_k": float(getattr(st.session_state.forecaster, "band_k", 1.0)),
+                    "max_dev_pct": float(results.get("max_dev", getattr(st.session_state.forecaster, "max_dev", 0.05)) * 100.0),
+                    "months": int(len(fc.index)),
+                    "cagr_pct_per_year": float(cagr * 100.0) if cagr is not None else None,
+                }
+                # Series (trim to last max_months when compact)
+                def _series(df: pd.DataFrame, col: str) -> list[dict]:
+                    if col not in df.columns:
+                        return []
+                    s = df[col].astype(float)
+                    if compact and isinstance(max_months, int) and max_months > 0:
+                        s = s.iloc[-max_months:]
+                    return [{"date": d.strftime("%Y-%m"), "mw": float(v)} for d, v in s.items()]
+                out["series"] = {
+                    "p50": _series(fc, base_col),
+                    "p10": _series(fc, "p10"),
+                    "p90": _series(fc, "p90"),
+                    "rjpp": _series(fc, "RJPP") if "RJPP" in fc.columns else [],
+                }
+                # History snapshot
+                try:
+                    comb = results.get("combined_forecast")
+                    if isinstance(comb, pd.DataFrame) and "Combined" in comb.columns:
+                        hist_end = fc.index.min() - pd.offsets.MonthBegin(1)
+                        hist = comb["Combined"].loc[:hist_end].dropna()
+                        last_actual = float(hist.iloc[-1]) if len(hist) else None
+                        hist12 = hist.tail(12)
+                        out["history"] = {
+                            "last_actual_mw": last_actual,
+                            "last_12m_avg_mw": float(hist12.mean()) if len(hist12) else None,
+                            "last_12m_energy_gwh": float((hist12 * pd.Series(hist12.index.days_in_month, index=hist12.index) * 24).sum() / 1000) if len(hist12) else None,
+                        }
+                except Exception:
+                    out["history"] = {}
+
+                # Next 12 months summary
+                try:
+                    nxt = fc[base_col].astype(float).iloc[:12]
+                    hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float).iloc[:12] * 24
+                    out["next_12m"] = {
+                        "avg_mw": float(nxt.mean()) if len(nxt) else None,
+                        "energy_gwh": float((nxt * hours).sum() / 1000) if len(nxt) else None,
+                        "peak_mw": float(nxt.max()) if len(nxt) else None,
+                        "peak_month": nxt.idxmax().strftime("%Y-%m") if len(nxt) else None,
+                    }
+                except Exception:
+                    out["next_12m"] = {}
+
+                # Peaks and uncertainty
+                try:
+                    p50s = fc[base_col].astype(float)
+                    p10s = fc["p10"].astype(float) if "p10" in fc.columns else None
+                    p90s = fc["p90"].astype(float) if "p90" in fc.columns else None
+                    top_idx = p50s.nlargest(3).index if len(p50s) else []
+                    out["peaks"] = {
+                        "top3": [
+                            {"month": i.strftime("%Y-%m"), "mw": float(p50s.loc[i])}
+                            for i in top_idx
+                        ]
+                    }
+                    if p10s is not None and p90s is not None:
+                        width = (p90s - p10s)
+                        out["uncertainty"] = {
+                            "avg_band_width_mw": float(width.mean()),
+                            "max_band_width_mw": float(width.max()),
+                        }
+                except Exception:
+                    pass
+
+                # Planning + compliance
+                try:
+                    out["planning"] = {"assumed_prm_pct": float(prm_pct * 100)}
+                    if "RJPP" in fc.columns:
+                        r = fc["RJPP"].replace(0, np.nan)
+                        dev = ((fc[base_col] - r) / r).abs()
+                        comp = float((dev <= (out["meta"]["max_dev_pct"] / 100.0)).mean() * 100)
+                        out["planning"]["rjpp_compliance_pct"] = comp
+                        # Rough monthly reserve check vs p90 + PRM
+                        if "p90" in fc.columns:
+                            need = fc["p90"] * (1.0 + prm_pct)
+                            short = (need - fc[base_col]).clip(lower=0)
+                            out["planning"]["avg_monthly_shortfall_mw_vs_p90_prm"] = float(short.mean())
+                except Exception:
+                    pass
+                # Validation & calibration
+                out["validation"] = {
+                    "metrics_by_model": results.get("validation_results", {}),
+                    "ensemble_val_metrics": results.get("ensemble_val_metrics", {}),
+                    "band_calibration_pct": float(results.get("calibration_pct")) if results.get("calibration_pct") is not None else None,
+                }
+                # Annual summary
+                try:
+                    hours = pd.Series(fc.index.days_in_month, index=fc.index, dtype=float) * 24
+                    energy_mwh = fc[base_col].astype(float) * hours
+                    annual = pd.DataFrame({
+                        "avg_mw": fc[base_col].groupby(fc.index.year).mean().astype(float),
+                        "energy_gwh": (energy_mwh.groupby(fc.index.year).sum() / 1000).astype(float),
+                        "peak_mw": fc[base_col].groupby(fc.index.year).max().astype(float),
+                    })
+                    out["annual"] = {int(y): {k: float(v) for k, v in row.items()} for y, row in annual.iterrows()}
+                except Exception:
+                    out["annual"] = {}
+                # Scenarios
+                fc_adj: pd.DataFrame | None = st.session_state.get("fc_adjusted")
+                if isinstance(fc_adj, pd.DataFrame) and not fc_adj.empty:
+                    adj_col = "p50_adj" if "p50_adj" in fc_adj.columns else ("Ensemble_adj" if "Ensemble_adj" in fc_adj.columns else None)
+                    out["adjusted"] = {"p50_adj": _series(fc_adj, adj_col)} if adj_col else {}
+                else:
+                    out["adjusted"] = {}
+                out["scenarios"] = [{k: v for k, v in s.items() if not str(k).startswith("_")} for s in (scenarios or [])]
+                # Weights & importance
+                out["weights"] = results.get("model_weights", {})
+                # Feature importance (top N per model if compact)
+                feat = results.get("feature_importance", {}) or {}
+                if compact and isinstance(feat, dict):
+                    trimmed = {}
+                    for m, d in feat.items():
+                        if isinstance(d, dict):
+                            top = sorted(d.items(), key=lambda kv: abs(kv[1]), reverse=True)[:max(1, int(top_features))]
+                            trimmed[m] = {k: float(v) for k, v in top}
+                    out["feature_importance"] = trimmed
+                else:
+                    out["feature_importance"] = feat
+                return out
+            except Exception:
+                return {"error": "build_failed"}
+
+        # Clean, defaulted AI (no UI toggles)
+        # Chat state
+        if "ai_chat_history" not in st.session_state:
+            st.session_state.ai_chat_history = []
+
+        # Subtle styling for a cleaner AI section
+        st.markdown(
+            """
+            <style>
+            .stMetric { border: 1px solid rgba(255,255,255,0.08); padding: 8px 10px; border-radius: 10px; }
+            .stTextArea textarea { font-size: 0.95rem; }
+            .stButton>button { height: 42px; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Build compact facts once for AI context
+        results_for_ai = st.session_state.get("results", {})
+        scenarios_for_ai = st.session_state.get("scenarios", [])
+
+        # Show existing chat
+        for msg in st.session_state.ai_chat_history:
+            with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+                st.markdown(msg["content"])
+
+        # Simple input
+        user_q = st.text_area("Your question to AI", value=DEFAULT_AI_QUERY, height=160)
+        colx1, colx2 = st.columns([1, 0.5])
+        ask_clicked = colx1.button("Ask AI", type="primary", use_container_width=True)
+        clear_clicked = colx2.button("Clear chat", use_container_width=True)
+
+        if clear_clicked:
+            st.session_state.ai_chat_history = []
+            st.rerun()
+
+        if ask_clicked and user_q.strip():
+            st.session_state.ai_chat_history.append({"role": "user", "content": user_q.strip()})
+            st.session_state.ai_chat_history = st.session_state.ai_chat_history[-20:]
+            with st.chat_message("assistant"):
+                status = st.status("Generating…", expanded=True)
+                with status:
+                    status.write("Extracting forecast metrics...")
+                    facts = _build_chat_facts_tidy(results_for_ai, scenarios_for_ai, compact=True, max_months=24, prm_pct=0.15)
+                    model_opts = _list_ollama_models_local()
+                    model = (model_opts[0] if model_opts else "llama3.2:3b")
+                    status.write(f"Using AI model: {model}")
+                    status.write("Building narrative context from forecast data...")
+                    try:
+                        # Increased num_predict for longer responses and num_ctx for better context understanding
+                        answer = _ollama_chat_local(model, user_q.strip(), facts, temperature=0.1, num_predict=800, num_ctx=4096, timeout_s=180)
+                    except Exception as e:
+                        answer = f"AI call failed: {e}"
+                    status.update(label="Answer received", state="complete")
+                final = sanitize_ai(answer)
+                st.markdown(final or "_No response._")
+            st.session_state.ai_chat_history.append({"role": "assistant", "content": final or ""})
+
+        # Transcript download
+        transcript_lines = []
+        for m in st.session_state.ai_chat_history:
+            who = "You" if m["role"] == "user" else "AI"
+            transcript_lines.append(f"**{who}:**\n\n{m['content']}\n")
+        st.download_button("Download transcript (.md)", "\n\n---\n\n".join(transcript_lines) or "", file_name="ai_insight_chat.md", mime="text/markdown", use_container_width=True)
+
+        # Check if forecast is available
+        if not results_for_ai or not results_for_ai.get("forecast") is not None:
+            st.info("Run the forecast first to generate AI insights.")
+
+if RUNNING_AS_MAIN:
+    main()
